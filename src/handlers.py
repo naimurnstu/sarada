@@ -8,6 +8,9 @@ Key fixes vs original:
   • safe_answer() wrapper silently swallows already-expired query errors.
   • Cookie deduplication is applied on upload (via config._deduplicate_cookie_lines).
   • error_handler registered on Application to prevent unhandled exception noise.
+  • NEW: A new download request CANCELS any in-progress run and starts fresh
+    immediately.  Uses asyncio.Event cancellation token so the running loop
+    detects the signal between profiles/URLs without killing the process.
 
 Access model:
   • Private chat     → owner only
@@ -22,6 +25,7 @@ Access model:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -164,8 +168,14 @@ class BotHandlers:
         self._cookies  = cookies
         self._groups   = groups
         self._topics   = topics
-        self._dl       = Downloader(cfg)
-        self._running  = False
+        self._dl          = Downloader(cfg)
+        self._running     = False
+        # Cancellation token: .set() signals the active run loop to abort
+        # between profiles/URLs.  Replaced with a fresh Event on every new run.
+        self._cancel_event: asyncio.Event = asyncio.Event()
+        # Strong reference to the running Task so we can await its teardown
+        # before starting a replacement run.
+        self._run_task: asyncio.Task | None = None
 
     # ── Access helpers ────────────────────────────────────────────────────────
 
@@ -384,7 +394,7 @@ class BotHandlers:
         if not self._running:
             await _send(ctx, chat.id, "ℹ️ Nothing is currently running\\.", reply_markup=_back_button())
             return
-        self._running = False
+        self._cancel_event.set()
         await _send(
             ctx, chat.id,
             "🛑 *Stop requested\\.* "
@@ -646,14 +656,21 @@ class BotHandlers:
     ) -> None:
         chat = update.effective_chat
 
-        if self._running:
+        # ── Cancel any in-progress run and wait for it to finish cleanly ──────
+        if self._running and self._run_task and not self._run_task.done():
             await _send(
                 ctx, chat.id,
-                "⚠️ A download is already in progress\\.\n"
-                "Use *🛑 Stop Download* to cancel first\\.",
-                reply_markup=_back_button(),
+                "🔄 *Cancelling previous download…* Starting new one right after\\.",
             )
-            return
+            # Signal the running loop to abort at its next checkpoint
+            self._cancel_event.set()
+            try:
+                # Give the old task up to 5 s to acknowledge the cancel signal
+                await asyncio.wait_for(
+                    asyncio.shield(self._run_task), timeout=5.0
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass  # Old task either finished or we give up waiting
 
         total = self._profiles.total_count()
         if total == 0:
@@ -665,9 +682,39 @@ class BotHandlers:
             )
             return
 
-        is_forum    = getattr(chat, "is_forum", False)
-        self._running = True
+        # ── Fresh cancellation token for this run ─────────────────────────────
+        self._cancel_event = asyncio.Event()
+        self._running      = True
+        is_forum           = getattr(chat, "is_forum", False)
 
+        # Wrap the actual work in a Task so future requests can cancel it
+        self._run_task = asyncio.get_event_loop().create_task(
+            self._run_download(ctx, chat, mode, is_forum)
+        )
+        # Await the task here so the handler waits for completion (or cancel)
+        try:
+            await self._run_task
+        except asyncio.CancelledError:
+            pass  # Cancelled by a subsequent request — already handled inside
+
+    # ── Actual download work (runs inside an asyncio Task) ────────────────────
+
+    async def _run_download(
+        self,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        chat,
+        mode: MediaMode,
+        is_forum: bool,
+    ) -> None:
+        """
+        Core download loop.  Runs as an asyncio Task so _execute_run can
+        cancel it cleanly when a new request arrives.
+
+        Cancellation is cooperative: self._cancel_event is checked between
+        every profile and every URL.  The currently-running gallery-dl
+        subprocess is allowed to finish its current file before stopping.
+        """
+        total = self._profiles.total_count()
         try:
             await _send(
                 ctx, chat.id,
@@ -681,8 +728,10 @@ class BotHandlers:
             for platform, urls in self._profiles.all().items():
                 if not urls:
                     continue
-                if not self._running:
-                    await _send(ctx, chat.id, "🛑 *Run cancelled by user\\.*")
+
+                # ── Cooperative cancellation checkpoint ────────────────────
+                if self._cancel_event.is_set():
+                    await _send(ctx, chat.id, "🛑 *Run cancelled — new request received\\.*")
                     return
 
                 plat_cfg = self._cfg.platforms[platform]
@@ -693,8 +742,9 @@ class BotHandlers:
                 )
 
                 for url in urls:
-                    if not self._running:
-                        await _send(ctx, chat.id, "🛑 *Run cancelled by user\\.*")
+                    # ── Cooperative cancellation checkpoint ────────────────
+                    if self._cancel_event.is_set():
+                        await _send(ctx, chat.id, "🛑 *Run cancelled — new request received\\.*")
                         return
 
                     username  = Downloader._extract_username(url, plat_cfg) or url
@@ -805,6 +855,12 @@ class BotHandlers:
                 f"📥 *{grand_total}* new file\\(s\\) downloaded in total\\.",
                 reply_markup=_back_button(),
             )
+
+        except asyncio.CancelledError:
+            # Task was hard-cancelled (should not normally happen — we use
+            # the cooperative cancel_event instead, but handle it safely).
+            logger.info("Download task hard-cancelled for chat=%d", chat.id)
+            raise  # re-raise so asyncio can clean up the Task properly
 
         except Exception as exc:
             logger.exception("Unexpected error during run: %s", exc)
