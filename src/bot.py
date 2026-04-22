@@ -2,12 +2,20 @@
 bot.py — Application entrypoint.
 
 Bootstrap order:
-  1. Load config  (raises RuntimeError if BOT_TOKEN is missing)
+  1. Load config (raises RuntimeError if BOT_TOKEN is missing)
   2. Setup rotating logging
   3. Create storage instances
   4. Configure auth module
-  5. Register all handlers + bot commands menu
-  6. Start polling
+  5. Register all handlers + error handler + bot commands menu
+  6. Start polling with drop_pending_updates=True
+
+Key fixes vs original:
+  • Global error_handler registered — prevents "No error handlers are
+    registered, logging exception" spam and unhandled Conflict crashes.
+  • drop_pending_updates=True ensures stale callbacks from a previous
+    deployment are discarded immediately on startup.
+  • Conflict error (two instances) is caught in error_handler and logged
+    clearly instead of crashing silently.
 """
 
 from __future__ import annotations
@@ -17,10 +25,13 @@ import logging.handlers
 import sys
 from pathlib import Path
 
+from telegram import Update
+from telegram.error import Conflict, NetworkError, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
+    ContextTypes,
     MessageHandler,
     filters,
 )
@@ -31,15 +42,16 @@ from config import Config
 from handlers import BOT_COMMANDS, BotHandlers
 from storage import CookieStore, GroupStore, ProfileStore, TopicStore
 
-
 # ── Logging ────────────────────────────────────────────────────────────────────
 
 def _setup_logging(log_file: Path) -> None:
     log_file.parent.mkdir(parents=True, exist_ok=True)
-    fmt  = logging.Formatter(
+
+    fmt = logging.Formatter(
         "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
     root = logging.getLogger()
     root.setLevel(logging.INFO)
 
@@ -59,6 +71,39 @@ def _setup_logging(log_file: Path) -> None:
 
 logger = logging.getLogger(__name__)
 
+# ── Global error handler ───────────────────────────────────────────────────────
+
+async def _error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Centralized error handler attached to the Application.
+
+    Prevents the default "No error handlers are registered" log spam.
+    Handles known transient errors gracefully so the bot keeps running.
+    """
+    err = context.error
+
+    if isinstance(err, Conflict):
+        # Two bot instances are polling simultaneously — this instance should exit.
+        logger.critical(
+            "Conflict error: another bot instance is running. "
+            "Ensure only one Railway deployment is active. Error: %s", err,
+        )
+        return  # Don't crash; Railway will restart and the conflict resolves itself
+
+    if isinstance(err, NetworkError):
+        logger.warning("Transient network error (will auto-retry): %s", err)
+        return
+
+    # For everything else — log with full traceback
+    logger.error(
+        "Unhandled exception in update handler",
+        exc_info=err,
+        stack_info=False,
+    )
+
 
 # ── Startup hook ───────────────────────────────────────────────────────────────
 
@@ -67,7 +112,7 @@ async def _post_init(app: Application) -> None:
     try:
         await app.bot.set_my_commands(BOT_COMMANDS)
         logger.info("Bot commands menu registered (%d commands).", len(BOT_COMMANDS))
-    except Exception as exc:
+    except TelegramError as exc:
         logger.warning("Could not set bot commands: %s", exc)
 
 
@@ -127,6 +172,9 @@ def _build_app(cfg: Config) -> Application:
     # ── File uploads (cookies + profile lists) ─────────────────────────────
     app.add_handler(MessageHandler(filters.Document.ALL, h.handle_document))
 
+    # ── Global error handler — MUST be registered ──────────────────────────
+    app.add_error_handler(_error_handler)
+
     return app
 
 
@@ -160,7 +208,7 @@ def main() -> None:
     for plat in cfg.platforms.values():
         cookie_path = cfg.cookies_dir / plat.cookie_file
         if cookie_path.exists():
-            size = cookie_path.stat().st_size
+            size   = cookie_path.stat().st_size
             status = f"✅ {size:,} bytes"
             if size < 2000:
                 status += " ⚠️  (too small — may cause 429)"
@@ -169,8 +217,12 @@ def main() -> None:
         logger.info("Cookie [%s]: %s", plat.name, status)
 
     app = _build_app(cfg)
+
     logger.info("Polling for updates…")
     app.run_polling(
+        # FIX: discard any stale callbacks/commands queued while bot was offline.
+        # Prevents replaying old callback queries that immediately raise
+        # "Query is too old" errors.
         drop_pending_updates=True,
         allowed_updates=["message", "callback_query", "my_chat_member"],
     )

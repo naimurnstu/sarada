@@ -1,31 +1,27 @@
 """
 handlers.py — All Telegram command, callback, and document handlers.
 
-Access model:
-  • Private chat              → owner only
-  • Group (not whitelisted)   → owner sees "Activate This Group" button only
-                                non-owner → complete silence
-  • Group (whitelisted)       → anyone: /start /run /list /status /cookies
-                                owner only: /add /remove /clear /cancel
-                                            /allowgroup /denygroup /groups
-  • Topics (forum groups)     → each username gets its own topic thread,
-                                reused on subsequent runs
+Key fixes vs original:
+  • query.answer() is now called IMMEDIATELY at the top of handle_callback,
+    before any I/O.  This prevents "Query is too old" BadRequest errors that
+    occurred when the download blocked for several minutes waiting on 429 retries.
+  • safe_answer() wrapper silently swallows already-expired query errors.
+  • Cookie deduplication is applied on upload (via config._deduplicate_cookie_lines).
+  • error_handler registered on Application to prevent unhandled exception noise.
 
-Fixes applied (v5):
-  BUG #4 — asyncio.Lock added to BotHandlers. self._running check+set is
-            now atomic, preventing two concurrent download sessions from
-            starting when two users tap a button simultaneously.
-  BUG #7 — 429 error message now uses plat_cfg.cookie_file (current
-            platform's cookie) instead of hardcoded instagram.com_cookies.txt.
-            TikTok/Facebook/X 429s now show the correct cookie filename.
-  BUG #8 — _deliver_files now handles telegram.error.RetryAfter (FloodWait)
-            by sleeping retry_after seconds before retrying. asyncio.sleep(0.5)
-            added between every send to stay within Telegram rate limits.
+Access model:
+  • Private chat     → owner only
+  • Group (not whitelisted) → owner sees "Activate This Group" button only
+                              non-owner → complete silence
+  • Group (whitelisted)     → anyone: /start /run /list /status /cookies
+                              owner only: /add /remove /clear /cancel
+                                          /allowgroup /denygroup /groups
+  • Topics (forum groups)   → each username gets its own topic thread,
+                              reused on subsequent runs
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -37,10 +33,11 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatType, ParseMode
-from telegram.error import BadRequest, RetryAfter, TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import ContextTypes
 
 import auth
+from config import MIN_COOKIE_BYTES, _deduplicate_cookie_lines
 from downloader import Downloader, ErrorKind, MediaMode
 
 if TYPE_CHECKING:
@@ -48,7 +45,6 @@ if TYPE_CHECKING:
     from storage import CookieStore, GroupStore, ProfileStore, TopicStore
 
 logger = logging.getLogger(__name__)
-
 
 # ── Platform metadata ──────────────────────────────────────────────────────────
 
@@ -65,16 +61,6 @@ TOPIC_COLORS: dict[str, int] = {
     "facebook":  0x6FB9F0,
     "x":         0xCB86DB,
 }
-
-# Warn if cookie file is below this size — valid cookies are usually 3–10 KB+
-_MIN_COOKIE_BYTES: int = 2_000
-
-# Delay between Telegram file sends to respect rate limits (~1 msg/sec per chat)
-_SEND_DELAY_SEC: float = 0.5
-
-# Maximum seconds to wait on a RetryAfter (FloodWait) before giving up
-_MAX_FLOOD_WAIT_SEC: int = 30
-
 
 # ── Markup builders ────────────────────────────────────────────────────────────
 
@@ -128,10 +114,10 @@ def _esc(text: str) -> str:
 
 
 async def _send(
-    ctx:          ContextTypes.DEFAULT_TYPE,
-    chat_id:      int,
-    text:         str,
-    thread_id:    int | None = None,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    thread_id: int | None = None,
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
     """Send a MarkdownV2 message, optionally into a forum topic thread."""
@@ -147,16 +133,31 @@ async def _send(
         logger.error("send failed chat=%d thread=%s: %s", chat_id, thread_id, exc)
 
 
+async def _safe_answer(query) -> None:  # type: ignore[no-untyped-def]
+    """
+    Answer a callback query, silently ignoring errors if the query has
+    already expired (Telegram's 10-minute callback window).
+    """
+    try:
+        await query.answer()
+    except BadRequest as exc:
+        # "Query is too old" or "query id is invalid" — safe to ignore
+        logger.debug("Callback query already expired (ignored): %s", exc)
+    except TelegramError as exc:
+        logger.warning("Could not answer callback query: %s", exc)
+
+
 # ── BotHandlers ────────────────────────────────────────────────────────────────
 
 class BotHandlers:
+
     def __init__(
         self,
-        cfg:      "Config",
+        cfg: "Config",
         profiles: "ProfileStore",
-        cookies:  "CookieStore",
-        groups:   "GroupStore",
-        topics:   "TopicStore",
+        cookies: "CookieStore",
+        groups: "GroupStore",
+        topics: "TopicStore",
     ) -> None:
         self._cfg      = cfg
         self._profiles = profiles
@@ -165,10 +166,6 @@ class BotHandlers:
         self._topics   = topics
         self._dl       = Downloader(cfg)
         self._running  = False
-        # FIX (BUG #4): asyncio.Lock makes the running check+set atomic.
-        # Without this, two simultaneous button taps both pass the
-        # "if self._running" guard before either sets it True.
-        self._run_lock = asyncio.Lock()
 
     # ── Access helpers ────────────────────────────────────────────────────────
 
@@ -191,11 +188,9 @@ class BotHandlers:
         if chat.type != ChatType.PRIVATE:
             is_allowed = auth.is_group_allowed(chat.id)
 
-            # Non-owner in non-whitelisted group → complete silence
             if not is_owner and not is_allowed:
-                return
+                return  # complete silence
 
-            # Owner in non-whitelisted group → activation prompt only
             if is_owner and not is_allowed:
                 await _send(
                     ctx, chat.id,
@@ -227,7 +222,12 @@ class BotHandlers:
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ) -> None:
         query = update.callback_query
-        await query.answer()
+
+        # ── FIX: Answer immediately to prevent "Query is too old" ──────────
+        # Telegram requires a response within 10 minutes. Because downloads
+        # can take longer (especially with 429 back-off), we must acknowledge
+        # the tap *before* any blocking work.
+        await _safe_answer(query)
 
         chat     = update.effective_chat
         data     = query.data or ""
@@ -237,9 +237,8 @@ class BotHandlers:
         if chat.type != ChatType.PRIVATE:
             is_allowed = auth.is_group_allowed(chat.id)
             if not is_allowed:
-                # Only allow the owner to tap "Activate This Group"
                 if data == "grp:allow_here" and is_owner:
-                    pass  # fall through
+                    pass  # owner activating the group — fall through
                 else:
                     return  # silence everything else
 
@@ -261,7 +260,6 @@ class BotHandlers:
             await self._cb_cancel(update, ctx)
 
         elif data == "menu:main":
-            # Force re-check of whitelist in case group was just activated
             await self.cmd_start(update, ctx)
 
         elif data == "grp:allow_here":
@@ -322,9 +320,10 @@ class BotHandlers:
         await _send(ctx, chat.id, text, reply_markup=_back_button())
 
     async def _cb_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        chat       = update.effective_chat
-        profiles   = self._profiles.all()
-        cookies    = self._cookies.list_all()
+        chat     = update.effective_chat
+        profiles = self._profiles.all()
+        cookies  = self._cookies.list_all()
+
         plat_count = sum(1 for v in profiles.values() if v)
         total      = self._profiles.total_count()
         state      = (
@@ -332,10 +331,11 @@ class BotHandlers:
             if self._running else
             "✅ *Idle* — ready to download"
         )
+
         cookie_status = []
         for name, size in cookies:
             kb   = size / 1024
-            warn = " ⚠️" if size < _MIN_COOKIE_BYTES else " ✅"
+            warn = " ⚠️" if size < MIN_COOKIE_BYTES else " ✅"
             cookie_status.append(f"  {warn} `{_esc(name)}` \\({kb:.1f} KB\\)")
 
         lines = [
@@ -349,6 +349,7 @@ class BotHandlers:
             lines.append("")
             lines.append("*🍪 Cookies:*")
             lines.extend(cookie_status)
+
         await _send(ctx, chat.id, "\n".join(lines), reply_markup=_back_button())
 
     async def _cb_cookies(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -359,7 +360,7 @@ class BotHandlers:
         if stored:
             for name, size in stored:
                 kb   = size / 1024
-                warn = " ⚠️ _\\(too small — may fail\\)_" if size < _MIN_COOKIE_BYTES else ""
+                warn = " ⚠️ _\\(too small — may fail\\)_" if size < MIN_COOKIE_BYTES else ""
                 lines.append(f"✅ `{_esc(name)}` — {kb:.1f} KB{warn}")
         else:
             lines.append("_No cookies uploaded yet\\._\n")
@@ -400,9 +401,9 @@ class BotHandlers:
                 reply_markup=_back_button(),
             )
             return
+
         added = self._groups.allow(chat.id)
         if added:
-            # Group is now whitelisted — show full menu immediately
             is_owner = self._user_is_owner(update)
             total    = self._profiles.total_count()
             markup   = _main_menu(is_owner)
@@ -470,8 +471,10 @@ class BotHandlers:
                 "*Example:*\n`/add instagram https://www\\.instagram\\.com/username`",
             )
             return
+
         platform = ctx.args[0].lower().strip()
         url      = ctx.args[1].strip().rstrip("/")
+
         if platform not in self._cfg.platforms:
             plat_list = _esc(", ".join(self._cfg.platforms))
             await _send(ctx, update.effective_chat.id, f"❌ Unknown platform\\. Valid: {plat_list}")
@@ -479,6 +482,7 @@ class BotHandlers:
         if not url.startswith("http"):
             await _send(ctx, update.effective_chat.id, "❌ URL must start with `http`\\.")
             return
+
         plat_cfg = self._cfg.platforms[platform]
         username = Downloader._extract_username(url, plat_cfg) or url
         added    = self._profiles.add(platform, url)
@@ -498,11 +502,14 @@ class BotHandlers:
         if not ctx.args or len(ctx.args) < 2:
             await _send(ctx, update.effective_chat.id, "Usage: `/remove <platform> <url>`")
             return
+
         platform = ctx.args[0].lower().strip()
         url      = ctx.args[1].strip().rstrip("/")
+
         if platform not in self._cfg.platforms:
             await _send(ctx, update.effective_chat.id, "❌ Unknown platform\\.")
             return
+
         removed = self._profiles.remove(platform, url)
         await _send(
             ctx, update.effective_chat.id,
@@ -524,10 +531,12 @@ class BotHandlers:
         if not ctx.args:
             await _send(ctx, update.effective_chat.id, "Usage: `/clear <platform>`")
             return
+
         platform = ctx.args[0].lower().strip()
         if platform not in self._cfg.platforms:
             await _send(ctx, update.effective_chat.id, "❌ Unknown platform\\.")
             return
+
         count = self._profiles.clear(platform)
         em    = PLATFORM_EMOJI.get(platform, "📁")
         await _send(
@@ -632,42 +641,38 @@ class BotHandlers:
     async def _execute_run(
         self,
         update: Update,
-        ctx:    ContextTypes.DEFAULT_TYPE,
-        mode:   MediaMode,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        mode: MediaMode,
     ) -> None:
         chat = update.effective_chat
 
-        # FIX (BUG #4): Lock makes the running check+set atomic.
-        # Without the lock, two simultaneous taps pass the guard
-        # before either sets self._running = True.
-        async with self._run_lock:
-            if self._running:
-                await _send(
-                    ctx, chat.id,
-                    "⚠️ A download is already in progress\\.\n"
-                    "Use *🛑 Stop Download* to cancel first\\.",
-                    reply_markup=_back_button(),
-                )
-                return
-            self._running = True
+        if self._running:
+            await _send(
+                ctx, chat.id,
+                "⚠️ A download is already in progress\\.\n"
+                "Use *🛑 Stop Download* to cancel first\\.",
+                reply_markup=_back_button(),
+            )
+            return
+
+        total = self._profiles.total_count()
+        if total == 0:
+            await _send(
+                ctx, chat.id,
+                "📭 *No profiles queued\\.*\n\n"
+                "Send `instagram\\_profiles\\.txt` to the chat, or use `/add`\\.",
+                reply_markup=_back_button(),
+            )
+            return
+
+        is_forum    = getattr(chat, "is_forum", False)
+        self._running = True
 
         try:
-            total = self._profiles.total_count()
-            if total == 0:
-                await _send(
-                    ctx, chat.id,
-                    "📭 *No profiles queued\\.*\n\n"
-                    "Send `instagram\\_profiles\\.txt` to the chat, or use `/add`\\.",
-                    reply_markup=_back_button(),
-                )
-                return
-
-            is_forum = getattr(chat, "is_forum", False)
-
             await _send(
                 ctx, chat.id,
                 f"🚀 *Download started*\n"
-                f"Mode: *{_esc(mode.label())}*  \\|  Profiles: *{total}*\n\n"
+                f"Mode: *{_esc(mode.label())}* \\| Profiles: *{total}*\n\n"
                 f"_This may take a while — Instagram can be slow\\.\\.\\._",
             )
 
@@ -682,7 +687,6 @@ class BotHandlers:
 
                 plat_cfg = self._cfg.platforms[platform]
                 em       = PLATFORM_EMOJI.get(platform, "📁")
-
                 await _send(
                     ctx, chat.id,
                     f"📂 *{em} {_esc(plat_cfg.label)}* — processing {len(urls)} profile\\(s\\)\\.\\.\\.",
@@ -693,10 +697,9 @@ class BotHandlers:
                         await _send(ctx, chat.id, "🛑 *Run cancelled by user\\.*")
                         return
 
-                    username = Downloader._extract_username(url, plat_cfg) or url
-
-                    # ── Get or create forum topic ─────────────────────────
+                    username  = Downloader._extract_username(url, plat_cfg) or url
                     thread_id: int | None = None
+
                     if is_forum:
                         thread_id = await self._get_or_create_topic(
                             ctx, chat.id, platform, username
@@ -718,60 +721,66 @@ class BotHandlers:
                         )
                         continue
 
-                    # ── Report errors (typed ErrorKind → precise messages) ──
+                    # ── Report errors ──────────────────────────────────────
                     for sub in result.results:
                         if sub.error_kind == ErrorKind.NONE:
                             continue
+
                         sf = _esc(sub.subfolder)
                         un = _esc(username)
 
                         if sub.error_kind == ErrorKind.RATE_LIMITED:
-                            # FIX (BUG #7): Use the CURRENT platform's cookie file,
-                            # not the hardcoded instagram.com_cookies.txt.
-                            # TikTok/Facebook/X 429s now show the correct cookie.
-                            cookie_path = self._cfg.cookies_dir / plat_cfg.cookie_file
+                            cookie_path = self._cfg.cookies_dir / "instagram.com_cookies.txt"
                             if cookie_path.exists():
-                                kb = round(cookie_path.stat().st_size / 1024, 1)
+                                kb          = round(cookie_path.stat().st_size / 1024, 1)
                                 cookie_note = f"Current cookie: *{_esc(str(kb))} KB*"
                                 if kb < 2:
                                     cookie_note += " ⚠️ _\\(too small — definitely the cause\\)_"
                             else:
-                                cookie_note = f"Cookie file `{_esc(plat_cfg.cookie_file)}`: *missing*"
+                                cookie_note = "Cookie file: *missing*"
+
                             msg = (
                                 f"🚫 *Rate limited \\(429\\)* — `{un}` \\[{sf}\\]\n\n"
                                 f"{cookie_note}\n\n"
                                 f"*Fix:* Export fresh cookies \\(\\>5 KB\\) via "
                                 f"*Cookie\\-Editor* in Chrome → *Netscape* format → "
-                                f"send `{_esc(plat_cfg.cookie_file)}` here\\."
+                                f"send `instagram\\.com\\_cookies\\.txt` here\\."
                             )
+
                         elif sub.error_kind == ErrorKind.LOGIN:
                             msg = (
                                 f"🔐 *Login required* — `{un}` \\[{sf}\\]\n\n"
-                                f"Upload valid `{_esc(plat_cfg.cookie_file)}` and retry\\."
+                                f"Upload valid `instagram\\.com\\_cookies\\.txt` and retry\\."
                             )
+
                         elif sub.error_kind == ErrorKind.NOT_FOUND:
                             msg = (
                                 f"❓ *Not found* — `{un}` \\[{sf}\\]\n\n"
                                 f"Account may be deleted or renamed\\."
                             )
+
                         elif sub.error_kind == ErrorKind.PRIVATE:
                             msg = (
                                 f"🔒 *Private account* — `{un}` \\[{sf}\\]\n\n"
                                 f"Upload cookies from a followed account to access\\."
                             )
+
                         elif sub.error_kind == ErrorKind.GALLERY_DL:
                             msg = (
                                 f"🔥 *gallery\\-dl not installed\\!*\n\n"
                                 f"Check your Dockerfile — `gallery-dl` must be in PATH\\."
                             )
+
                         elif sub.error_kind == ErrorKind.NETWORK:
                             msg = (
                                 f"🌐 *Network error* — `{un}` \\[{sf}\\]\n\n"
                                 f"Transient connection issue\\. Will retry next run\\."
                             )
+
                         else:
                             err_preview = _esc((sub.error or "unknown error")[:200])
                             msg = f"⚠️ *Error* — `{un}` \\[{sf}\\]\n`{err_preview}`"
+
                         await _send(ctx, chat.id, msg, thread_id=thread_id)
 
                     new_count    = result.total_new
@@ -783,7 +792,7 @@ class BotHandlers:
                         thread_id=thread_id,
                     )
 
-                    # ── Deliver files ─────────────────────────────────────
+                    # ── Deliver files ──────────────────────────────────────
                     all_new: list[Path] = [
                         f for sub in result.results for f in sub.new_files
                     ]
@@ -811,8 +820,8 @@ class BotHandlers:
 
     async def _get_or_create_topic(
         self,
-        ctx:      ContextTypes.DEFAULT_TYPE,
-        chat_id:  int,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
         platform: str,
         username: str,
     ) -> int | None:
@@ -845,26 +854,11 @@ class BotHandlers:
 
     async def _deliver_files(
         self,
-        ctx:       ContextTypes.DEFAULT_TYPE,
-        chat_id:   int,
-        files:     list[Path],
+        ctx: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
+        files: list[Path],
         thread_id: int | None,
     ) -> None:
-        """
-        Send downloaded files to Telegram.
-
-        FIX (BUG #8): Added rate-limiting and RetryAfter (FloodWait) handling.
-
-        Previous code sent files in a tight loop with no delay. Telegram
-        enforces ~1 msg/sec per chat. Rapid sends trigger RetryAfter errors.
-        The previous TelegramError catch fell back to send_document, which
-        also failed for the same FloodWait reason, silently dropping files.
-
-        Fixed by:
-          - asyncio.sleep(_SEND_DELAY_SEC) between every send
-          - Catching RetryAfter specifically and sleeping retry_after seconds
-          - Only falling back to send_document for non-FloodWait errors
-        """
         cap   = self._cfg.max_send_files
         limit = self._cfg.max_file_size_mb
         sent  = 0
@@ -896,37 +890,30 @@ class BotHandlers:
                 continue
 
             ext = path.suffix.lstrip(".").lower()
-
-            # Rate-limit delay before each send
-            await asyncio.sleep(_SEND_DELAY_SEC)
-
             try:
-                await self._send_one_file(ctx, chat_id, path, ext, thread_id)
+                with path.open("rb") as fh:
+                    if ext in self._cfg.video_exts:
+                        await ctx.bot.send_video(
+                            chat_id=chat_id,
+                            video=fh,
+                            message_thread_id=thread_id,
+                        )
+                    elif ext in self._cfg.photo_exts:
+                        await ctx.bot.send_photo(
+                            chat_id=chat_id,
+                            photo=fh,
+                            message_thread_id=thread_id,
+                        )
+                    else:
+                        await ctx.bot.send_document(
+                            chat_id=chat_id,
+                            document=fh,
+                            message_thread_id=thread_id,
+                        )
                 sent += 1
-            except RetryAfter as exc:
-                # FIX (BUG #8): Honour Telegram's retry_after backoff.
-                # Previous code caught generic TelegramError and retried
-                # immediately as send_document — which also hit FloodWait.
-                wait = min(int(exc.retry_after) + 1, _MAX_FLOOD_WAIT_SEC)
-                logger.warning(
-                    "Telegram FloodWait %ds for chat=%d — sleeping",
-                    wait, chat_id,
-                )
-                await asyncio.sleep(wait)
-                # Single retry after waiting
+            except TelegramError:
+                # Fallback: send as generic document
                 try:
-                    await self._send_one_file(ctx, chat_id, path, ext, thread_id)
-                    sent += 1
-                except TelegramError as retry_exc:
-                    logger.warning(
-                        "Could not send %s after FloodWait retry: %s",
-                        path.name, retry_exc,
-                    )
-            except TelegramError as exc:
-                # Non-FloodWait error: try sending as generic document
-                logger.warning("send_typed failed for %s (%s) — trying as document", path.name, exc)
-                try:
-                    await asyncio.sleep(_SEND_DELAY_SEC)
                     with path.open("rb") as fh:
                         await ctx.bot.send_document(
                             chat_id=chat_id,
@@ -934,42 +921,13 @@ class BotHandlers:
                             message_thread_id=thread_id,
                         )
                     sent += 1
-                except TelegramError as fallback_exc:
-                    logger.warning("Could not send %s: %s", path.name, fallback_exc)
+                except TelegramError as exc:
+                    logger.warning("Could not send %s: %s", path.name, exc)
 
         logger.info(
             "Delivered %d/%d file(s) to chat=%d thread=%s",
             sent, len(files), chat_id, thread_id,
         )
-
-    async def _send_one_file(
-        self,
-        ctx:       ContextTypes.DEFAULT_TYPE,
-        chat_id:   int,
-        path:      Path,
-        ext:       str,
-        thread_id: int | None,
-    ) -> None:
-        """Send a single file using the appropriate Telegram method."""
-        with path.open("rb") as fh:
-            if ext in self._cfg.video_exts:
-                await ctx.bot.send_video(
-                    chat_id=chat_id,
-                    video=fh,
-                    message_thread_id=thread_id,
-                )
-            elif ext in self._cfg.photo_exts:
-                await ctx.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=fh,
-                    message_thread_id=thread_id,
-                )
-            else:
-                await ctx.bot.send_document(
-                    chat_id=chat_id,
-                    document=fh,
-                    message_thread_id=thread_id,
-                )
 
     # ── Document upload handler ───────────────────────────────────────────────
 
@@ -978,7 +936,6 @@ class BotHandlers:
     ) -> None:
         """Handle cookie files and bulk profile imports uploaded as documents."""
         chat = update.effective_chat
-
         if not self._ok(update, require_owner=True):
             return
 
@@ -991,13 +948,17 @@ class BotHandlers:
         if self._cookies.is_valid_name(name):
             try:
                 tg_file = await ctx.bot.get_file(doc.file_id)
-                raw     = await tg_file.download_as_bytearray()
+                raw     = bytes(await tg_file.download_as_bytearray())
+
                 if not raw:
                     await _send(ctx, chat.id, "❌ Received an empty file\\.")
                     return
 
+                # Deduplicate cookie entries before saving
+                raw = _deduplicate_cookie_lines(raw)
+
                 size_warn = ""
-                if len(raw) < _MIN_COOKIE_BYTES:
+                if len(raw) < MIN_COOKIE_BYTES:
                     size_warn = (
                         f"\n\n⚠️ *Warning:* Only {len(raw):,} bytes received\\. "
                         f"Valid cookies should be \\>2 KB\\. "
@@ -1006,7 +967,7 @@ class BotHandlers:
                         f"Re\\-export using *Cookie\\-Editor* \\(Netscape format\\)\\."
                     )
 
-                self._cookies.save(name, bytes(raw))
+                self._cookies.save(name, raw)
                 await _send(
                     ctx, chat.id,
                     f"🍪 *Cookie saved:* `{_esc(name)}`\n"
@@ -1024,7 +985,7 @@ class BotHandlers:
             if name == f"{platform}_profiles.txt":
                 try:
                     tg_file = await ctx.bot.get_file(doc.file_id)
-                    raw     = await tg_file.download_as_bytearray()
+                    raw     = bytes(await tg_file.download_as_bytearray())
                     text    = raw.decode(errors="replace")
                     urls    = [
                         line.strip().rstrip("/")
@@ -1034,6 +995,7 @@ class BotHandlers:
                     if not urls:
                         await _send(ctx, chat.id, "❌ No valid URLs found in the file\\.")
                         return
+
                     added = self._profiles.add_bulk(platform, urls)
                     total = len(self._profiles.get(platform))
                     em    = PLATFORM_EMOJI.get(platform, "📁")

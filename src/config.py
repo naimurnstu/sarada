@@ -1,30 +1,33 @@
 """
 config.py — Central configuration loaded from environment variables.
 
-Supports setting cookies directly via Railway environment variables:
-  COOKIE_INSTAGRAM  → raw Netscape cookie text OR base64-encoded content
-  COOKIE_TIKTOK     → raw Netscape cookie text OR base64-encoded content
-  COOKIE_FACEBOOK   → raw Netscape cookie text OR base64-encoded content
-  COOKIE_X          → raw Netscape cookie text OR base64-encoded content
+Cookie injection order (highest priority wins):
+  1. Manually uploaded file in cookies_dir  (via Telegram document upload)
+  2. COOKIE_* environment variable          (Railway variable — plain text OR base64)
 
-Detection order:
-  1. If value starts with "# Netscape" → treat as raw text (most common)
-  2. Otherwise → try base64 decode, fall back to raw text
+On every startup the env-var cookies are ALWAYS written so Railway variable
+updates take effect without a re-upload.  A manually uploaded file uploaded
+*after* startup overwrites the env-var version in place.
 
-These are written to /data/cookies/ on startup if the cookie file does not
-already exist. Manually uploaded cookies always take precedence.
+Supported env vars:
+  COOKIE_INSTAGRAM  → instagram.com_cookies.txt
+  COOKIE_TIKTOK     → tiktok.com_cookies.txt
+  COOKIE_FACEBOOK   → facebook.com_cookies.txt
+  COOKIE_X          → x.com_cookies.txt
 """
 
 from __future__ import annotations
 
 import base64
-import binascii
 import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# ── Minimum cookie size that gallery-dl needs to avoid 429 ────────────────────
+MIN_COOKIE_BYTES: int = 2_000
 
 
 def _require(key: str) -> str:
@@ -45,32 +48,34 @@ def _path_env(key: str, default: str) -> Path:
     return Path(os.environ.get(key, default))
 
 
+# ── Data models ───────────────────────────────────────────────────────────────
+
 @dataclass(frozen=True)
 class PlatformConfig:
-    name:        str
-    label:       str
-    url_prefix:  str
+    name: str
+    label: str
+    url_prefix: str
     cookie_file: str
-    sleep_sec:   str
-    folder:      str
+    sleep_sec: str
+    folder: str
 
 
 @dataclass(frozen=True)
 class Config:
     # ── Telegram ──────────────────────────────────────────────────────────────
-    bot_token:     str
-    owner_id:      int
+    bot_token: str
+    owner_id: int
 
     # ── Paths ─────────────────────────────────────────────────────────────────
-    base_dir:      Path
-    cookies_dir:   Path
+    base_dir: Path
+    cookies_dir: Path
     profiles_file: Path
-    log_file:      Path
+    log_file: Path
 
     # ── Download limits ───────────────────────────────────────────────────────
-    max_send_files:   int
+    max_send_files: int
     max_file_size_mb: int
-    max_concurrent:   int
+    max_concurrent: int
 
     # ── Platform registry ─────────────────────────────────────────────────────
     platforms: dict[str, PlatformConfig] = field(default_factory=dict)
@@ -103,67 +108,103 @@ _COOKIE_ENV_MAP: dict[str, str] = {
     "COOKIE_X":         "x.com_cookies.txt",
 }
 
-# Netscape cookie files always start with this header
-_NETSCAPE_HEADER = "# netscape"
-
 
 def _decode_cookie_value(value: str) -> bytes:
     """
-    FIX (BUG #9): Previously always tried base64 first, which silently
-    corrupted raw Netscape cookie text (valid base64 alphabet).
+    Accept either:
+      • Plain Netscape cookie text (starts with '#' or '.domain')
+      • Base64-encoded cookie text
 
-    Correct detection order:
-      1. If starts with '# Netscape' (case-insensitive) → raw text
-      2. Otherwise → attempt base64 decode
-      3. If base64 fails → raw text
-
-    This ensures pasting raw Netscape cookies directly works correctly.
+    Returns raw bytes ready to write to disk.
     """
     stripped = value.strip()
-    if stripped.lower().startswith(_NETSCAPE_HEADER):
-        # Raw Netscape format — use as-is
+
+    # Fast path: plain-text Netscape cookie file
+    if stripped.startswith("#") or stripped.startswith(".") or "\t" in stripped:
         return stripped.encode("utf-8")
 
-    # Try base64 decode (for users who base64-encoded their cookie file)
+    # Try base64 decode
     try:
-        decoded = base64.b64decode(stripped, validate=True)
-        # Sanity check: decoded bytes should look like a text cookie file
-        try:
-            decoded.decode("utf-8")
+        decoded = base64.b64decode(stripped)
+        # Validate it looks like a cookie file after decoding
+        text = decoded.decode("utf-8", errors="replace")
+        if "#" in text or "\t" in text or ".instagram" in text:
             return decoded
-        except UnicodeDecodeError:
-            # Decoded to non-UTF-8 binary → wasn't actually base64 cookie data
-            pass
-    except (binascii.Error, ValueError):
+    except Exception:
         pass
 
-    # Fallback: treat as raw text
+    # Fallback: treat as plain text regardless
     return stripped.encode("utf-8")
 
 
-def _inject_env_cookies(cookies_dir: Path) -> None:
+def _deduplicate_cookie_lines(raw: bytes) -> bytes:
     """
-    If COOKIE_* env vars are set, decode them and write to the cookies
-    directory. Existing files are NOT overwritten so that manually uploaded
-    cookies take precedence.
+    Remove duplicate cookie entries from a Netscape cookie file.
+    Keeps the last occurrence of each (domain, name) pair so that
+    the freshest value wins.  Header comment lines are preserved.
+    """
+    try:
+        text = raw.decode("utf-8", errors="replace")
+    except Exception:
+        return raw
+
+    header_lines: list[str] = []
+    cookie_map: dict[tuple[str, str], str] = {}   # (domain, name) → full line
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            header_lines.append(line)
+            continue
+        parts = stripped.split("\t")
+        if len(parts) >= 6:
+            domain = parts[0]
+            name = parts[5]
+            cookie_map[(domain, name)] = line
+        else:
+            # Malformed line — keep it verbatim
+            header_lines.append(line)
+
+    result_lines = header_lines + list(cookie_map.values())
+    return "\n".join(result_lines).encode("utf-8")
+
+
+def inject_env_cookies(cookies_dir: Path) -> None:
+    """
+    Write COOKIE_* env vars to disk on every startup.
+    Env vars are ALWAYS written (not skipped if file exists) so that
+    updating the Railway variable takes effect without a re-upload.
+
+    A cookie uploaded manually via Telegram will overwrite the file on
+    disk at upload time (handled by CookieStore.save), so manual uploads
+    always remain authoritative for the current process lifetime.
     """
     cookies_dir.mkdir(parents=True, exist_ok=True)
+
     for env_key, filename in _COOKIE_ENV_MAP.items():
         value = os.environ.get(env_key, "").strip()
         if not value:
             continue
+
         dest = cookies_dir / filename
-        if dest.exists():
-            logger.debug(
-                "Cookie env-var %s ignored — %s already exists.", env_key, filename
-            )
-            continue
+
         try:
-            data = _decode_cookie_value(value)
-            dest.write_bytes(data)
+            raw = _decode_cookie_value(value)
+            raw = _deduplicate_cookie_lines(raw)
+
+            if len(raw) < MIN_COOKIE_BYTES:
+                logger.warning(
+                    "Cookie from %s is only %d bytes — likely missing session "
+                    "cookies; gallery-dl may receive 429 errors.",
+                    env_key, len(raw),
+                )
+
+            dest.write_bytes(raw)
             logger.info(
-                "Cookie injected from env %s → %s (%d bytes)",
-                env_key, filename, len(data),
+                "Cookie written from env %s → %s (%d bytes)",
+                env_key, filename, len(raw),
             )
         except OSError as exc:
             logger.error("Failed to write cookie from %s: %s", env_key, exc)
@@ -173,10 +214,10 @@ def _inject_env_cookies(cookies_dir: Path) -> None:
 
 def load() -> Config:
     """Build and return the singleton Config from the environment."""
-    base_dir    = _path_env("DOWNLOAD_DIR",   "/data/downloads")
-    cookies_dir = _path_env("COOKIES_DIR",    "/data/cookies")
-    data_dir    = _path_env("DATA_DIR",       "/data")
-    log_dir     = _path_env("LOG_DIR",        "/data/logs")
+    base_dir    = _path_env("DOWNLOAD_DIR", "/data/downloads")
+    cookies_dir = _path_env("COOKIES_DIR",  "/data/cookies")
+    data_dir    = _path_env("DATA_DIR",     "/data")
+    log_dir     = _path_env("LOG_DIR",      "/data/logs")
 
     platforms: dict[str, PlatformConfig] = {
         "instagram": PlatformConfig(
@@ -226,7 +267,7 @@ def load() -> Config:
         platforms=platforms,
     )
 
-    # Inject cookies from env vars (Railway variables alternative to file upload)
-    _inject_env_cookies(cookies_dir)
+    # Always inject / refresh cookies from env vars on startup
+    inject_env_cookies(cookies_dir)
 
     return cfg
