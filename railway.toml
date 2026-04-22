@@ -1,0 +1,14 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python -u bot.py"
+restartPolicyType = "on-failure"
+restartPolicyMaxRetries = 10
+
+# Mount a Railway Volume at /data to persist:
+#   /data/profiles.json
+#   /data/cookies/
+#   /data/downloads/
+#   /data/logs/
