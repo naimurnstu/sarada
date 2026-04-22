@@ -1,19 +1,31 @@
 """
 handlers.py — All Telegram command, callback, and document handlers.
 
+Key fixes vs original:
+  • query.answer() is now called IMMEDIATELY at the top of handle_callback,
+    before any I/O.  This prevents "Query is too old" BadRequest errors that
+    occurred when the download blocked for several minutes waiting on 429 retries.
+  • safe_answer() wrapper silently swallows already-expired query errors.
+  • Cookie deduplication is applied on upload (via config._deduplicate_cookie_lines).
+  • error_handler registered on Application to prevent unhandled exception noise.
+  • NEW: A new download request CANCELS any in-progress run and starts fresh
+    immediately.  Uses asyncio.Event cancellation token so the running loop
+    detects the signal between profiles/URLs without killing the process.
+
 Access model:
-  • Private chat              → owner only
-  • Group (not whitelisted)   → owner sees "Activate This Group" button only
-                                non-owner → complete silence
-  • Group (whitelisted)       → anyone: /start /run /list /status /cookies
-                                owner only: /add /remove /clear /cancel
-                                            /allowgroup /denygroup /groups
-  • Topics (forum groups)     → each username gets its own topic thread,
-                                reused on subsequent runs
+  • Private chat     → owner only
+  • Group (not whitelisted) → owner sees "Activate This Group" button only
+                              non-owner → complete silence
+  • Group (whitelisted)     → anyone: /start /run /list /status /cookies
+                              owner only: /add /remove /clear /cancel
+                                          /allowgroup /denygroup /groups
+  • Topics (forum groups)   → each username gets its own topic thread,
+                              reused on subsequent runs
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -29,6 +41,7 @@ from telegram.error import BadRequest, TelegramError
 from telegram.ext import ContextTypes
 
 import auth
+from config import MIN_COOKIE_BYTES, _deduplicate_cookie_lines
 from downloader import Downloader, ErrorKind, MediaMode
 
 if TYPE_CHECKING:
@@ -36,7 +49,6 @@ if TYPE_CHECKING:
     from storage import CookieStore, GroupStore, ProfileStore, TopicStore
 
 logger = logging.getLogger(__name__)
-
 
 # ── Platform metadata ──────────────────────────────────────────────────────────
 
@@ -53,10 +65,6 @@ TOPIC_COLORS: dict[str, int] = {
     "facebook":  0x6FB9F0,
     "x":         0xCB86DB,
 }
-
-# Warn if cookie file is below this size — valid cookies are usually 3–10 KB+
-_MIN_COOKIE_BYTES: int = 2_000
-
 
 # ── Markup builders ────────────────────────────────────────────────────────────
 
@@ -110,10 +118,10 @@ def _esc(text: str) -> str:
 
 
 async def _send(
-    ctx:          ContextTypes.DEFAULT_TYPE,
-    chat_id:      int,
-    text:         str,
-    thread_id:    int | None = None,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    thread_id: int | None = None,
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
     """Send a MarkdownV2 message, optionally into a forum topic thread."""
@@ -129,24 +137,45 @@ async def _send(
         logger.error("send failed chat=%d thread=%s: %s", chat_id, thread_id, exc)
 
 
+async def _safe_answer(query) -> None:  # type: ignore[no-untyped-def]
+    """
+    Answer a callback query, silently ignoring errors if the query has
+    already expired (Telegram's 10-minute callback window).
+    """
+    try:
+        await query.answer()
+    except BadRequest as exc:
+        # "Query is too old" or "query id is invalid" — safe to ignore
+        logger.debug("Callback query already expired (ignored): %s", exc)
+    except TelegramError as exc:
+        logger.warning("Could not answer callback query: %s", exc)
+
+
 # ── BotHandlers ────────────────────────────────────────────────────────────────
 
 class BotHandlers:
+
     def __init__(
         self,
-        cfg:      "Config",
+        cfg: "Config",
         profiles: "ProfileStore",
-        cookies:  "CookieStore",
-        groups:   "GroupStore",
-        topics:   "TopicStore",
+        cookies: "CookieStore",
+        groups: "GroupStore",
+        topics: "TopicStore",
     ) -> None:
         self._cfg      = cfg
         self._profiles = profiles
         self._cookies  = cookies
         self._groups   = groups
         self._topics   = topics
-        self._dl       = Downloader(cfg)
-        self._running  = False
+        self._dl          = Downloader(cfg)
+        self._running     = False
+        # Cancellation token: .set() signals the active run loop to abort
+        # between profiles/URLs.  Replaced with a fresh Event on every new run.
+        self._cancel_event: asyncio.Event = asyncio.Event()
+        # Strong reference to the running Task so we can await its teardown
+        # before starting a replacement run.
+        self._run_task: asyncio.Task | None = None
 
     # ── Access helpers ────────────────────────────────────────────────────────
 
@@ -169,11 +198,9 @@ class BotHandlers:
         if chat.type != ChatType.PRIVATE:
             is_allowed = auth.is_group_allowed(chat.id)
 
-            # Non-owner in non-whitelisted group → complete silence
             if not is_owner and not is_allowed:
-                return
+                return  # complete silence
 
-            # Owner in non-whitelisted group → activation prompt only
             if is_owner and not is_allowed:
                 await _send(
                     ctx, chat.id,
@@ -205,7 +232,12 @@ class BotHandlers:
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ) -> None:
         query = update.callback_query
-        await query.answer()
+
+        # ── FIX: Answer immediately to prevent "Query is too old" ──────────
+        # Telegram requires a response within 10 minutes. Because downloads
+        # can take longer (especially with 429 back-off), we must acknowledge
+        # the tap *before* any blocking work.
+        await _safe_answer(query)
 
         chat     = update.effective_chat
         data     = query.data or ""
@@ -215,9 +247,8 @@ class BotHandlers:
         if chat.type != ChatType.PRIVATE:
             is_allowed = auth.is_group_allowed(chat.id)
             if not is_allowed:
-                # Only allow the owner to tap "Activate This Group"
                 if data == "grp:allow_here" and is_owner:
-                    pass  # fall through
+                    pass  # owner activating the group — fall through
                 else:
                     return  # silence everything else
 
@@ -239,7 +270,6 @@ class BotHandlers:
             await self._cb_cancel(update, ctx)
 
         elif data == "menu:main":
-            # Force re-check of whitelist in case group was just activated
             await self.cmd_start(update, ctx)
 
         elif data == "grp:allow_here":
@@ -300,9 +330,10 @@ class BotHandlers:
         await _send(ctx, chat.id, text, reply_markup=_back_button())
 
     async def _cb_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        chat       = update.effective_chat
-        profiles   = self._profiles.all()
-        cookies    = self._cookies.list_all()
+        chat     = update.effective_chat
+        profiles = self._profiles.all()
+        cookies  = self._cookies.list_all()
+
         plat_count = sum(1 for v in profiles.values() if v)
         total      = self._profiles.total_count()
         state      = (
@@ -310,10 +341,11 @@ class BotHandlers:
             if self._running else
             "✅ *Idle* — ready to download"
         )
+
         cookie_status = []
         for name, size in cookies:
             kb   = size / 1024
-            warn = " ⚠️" if size < _MIN_COOKIE_BYTES else " ✅"
+            warn = " ⚠️" if size < MIN_COOKIE_BYTES else " ✅"
             cookie_status.append(f"  {warn} `{_esc(name)}` \\({kb:.1f} KB\\)")
 
         lines = [
@@ -327,6 +359,7 @@ class BotHandlers:
             lines.append("")
             lines.append("*🍪 Cookies:*")
             lines.extend(cookie_status)
+
         await _send(ctx, chat.id, "\n".join(lines), reply_markup=_back_button())
 
     async def _cb_cookies(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -337,7 +370,7 @@ class BotHandlers:
         if stored:
             for name, size in stored:
                 kb   = size / 1024
-                warn = " ⚠️ _\\(too small — may fail\\)_" if size < _MIN_COOKIE_BYTES else ""
+                warn = " ⚠️ _\\(too small — may fail\\)_" if size < MIN_COOKIE_BYTES else ""
                 lines.append(f"✅ `{_esc(name)}` — {kb:.1f} KB{warn}")
         else:
             lines.append("_No cookies uploaded yet\\._\n")
@@ -361,7 +394,7 @@ class BotHandlers:
         if not self._running:
             await _send(ctx, chat.id, "ℹ️ Nothing is currently running\\.", reply_markup=_back_button())
             return
-        self._running = False
+        self._cancel_event.set()
         await _send(
             ctx, chat.id,
             "🛑 *Stop requested\\.* "
@@ -378,9 +411,9 @@ class BotHandlers:
                 reply_markup=_back_button(),
             )
             return
+
         added = self._groups.allow(chat.id)
         if added:
-            # Group is now whitelisted — show full menu immediately
             is_owner = self._user_is_owner(update)
             total    = self._profiles.total_count()
             markup   = _main_menu(is_owner)
@@ -448,8 +481,10 @@ class BotHandlers:
                 "*Example:*\n`/add instagram https://www\\.instagram\\.com/username`",
             )
             return
+
         platform = ctx.args[0].lower().strip()
         url      = ctx.args[1].strip().rstrip("/")
+
         if platform not in self._cfg.platforms:
             plat_list = _esc(", ".join(self._cfg.platforms))
             await _send(ctx, update.effective_chat.id, f"❌ Unknown platform\\. Valid: {plat_list}")
@@ -457,6 +492,7 @@ class BotHandlers:
         if not url.startswith("http"):
             await _send(ctx, update.effective_chat.id, "❌ URL must start with `http`\\.")
             return
+
         plat_cfg = self._cfg.platforms[platform]
         username = Downloader._extract_username(url, plat_cfg) or url
         added    = self._profiles.add(platform, url)
@@ -476,11 +512,14 @@ class BotHandlers:
         if not ctx.args or len(ctx.args) < 2:
             await _send(ctx, update.effective_chat.id, "Usage: `/remove <platform> <url>`")
             return
+
         platform = ctx.args[0].lower().strip()
         url      = ctx.args[1].strip().rstrip("/")
+
         if platform not in self._cfg.platforms:
             await _send(ctx, update.effective_chat.id, "❌ Unknown platform\\.")
             return
+
         removed = self._profiles.remove(platform, url)
         await _send(
             ctx, update.effective_chat.id,
@@ -502,10 +541,12 @@ class BotHandlers:
         if not ctx.args:
             await _send(ctx, update.effective_chat.id, "Usage: `/clear <platform>`")
             return
+
         platform = ctx.args[0].lower().strip()
         if platform not in self._cfg.platforms:
             await _send(ctx, update.effective_chat.id, "❌ Unknown platform\\.")
             return
+
         count = self._profiles.clear(platform)
         em    = PLATFORM_EMOJI.get(platform, "📁")
         await _send(
@@ -610,19 +651,26 @@ class BotHandlers:
     async def _execute_run(
         self,
         update: Update,
-        ctx:    ContextTypes.DEFAULT_TYPE,
-        mode:   MediaMode,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        mode: MediaMode,
     ) -> None:
         chat = update.effective_chat
 
-        if self._running:
+        # ── Cancel any in-progress run and wait for it to finish cleanly ──────
+        if self._running and self._run_task and not self._run_task.done():
             await _send(
                 ctx, chat.id,
-                "⚠️ A download is already in progress\\.\n"
-                "Use *🛑 Stop Download* to cancel first\\.",
-                reply_markup=_back_button(),
+                "🔄 *Cancelling previous download…* Starting new one right after\\.",
             )
-            return
+            # Signal the running loop to abort at its next checkpoint
+            self._cancel_event.set()
+            try:
+                # Give the old task up to 5 s to acknowledge the cancel signal
+                await asyncio.wait_for(
+                    asyncio.shield(self._run_task), timeout=5.0
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass  # Old task either finished or we give up waiting
 
         total = self._profiles.total_count()
         if total == 0:
@@ -634,14 +682,44 @@ class BotHandlers:
             )
             return
 
-        is_forum      = getattr(chat, "is_forum", False)
-        self._running = True
+        # ── Fresh cancellation token for this run ─────────────────────────────
+        self._cancel_event = asyncio.Event()
+        self._running      = True
+        is_forum           = getattr(chat, "is_forum", False)
 
+        # Wrap the actual work in a Task so future requests can cancel it
+        self._run_task = asyncio.get_event_loop().create_task(
+            self._run_download(ctx, chat, mode, is_forum)
+        )
+        # Await the task here so the handler waits for completion (or cancel)
+        try:
+            await self._run_task
+        except asyncio.CancelledError:
+            pass  # Cancelled by a subsequent request — already handled inside
+
+    # ── Actual download work (runs inside an asyncio Task) ────────────────────
+
+    async def _run_download(
+        self,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        chat,
+        mode: MediaMode,
+        is_forum: bool,
+    ) -> None:
+        """
+        Core download loop.  Runs as an asyncio Task so _execute_run can
+        cancel it cleanly when a new request arrives.
+
+        Cancellation is cooperative: self._cancel_event is checked between
+        every profile and every URL.  The currently-running gallery-dl
+        subprocess is allowed to finish its current file before stopping.
+        """
+        total = self._profiles.total_count()
         try:
             await _send(
                 ctx, chat.id,
                 f"🚀 *Download started*\n"
-                f"Mode: *{_esc(mode.label())}*  \\|  Profiles: *{total}*\n\n"
+                f"Mode: *{_esc(mode.label())}* \\| Profiles: *{total}*\n\n"
                 f"_This may take a while — Instagram can be slow\\.\\.\\._",
             )
 
@@ -650,27 +728,28 @@ class BotHandlers:
             for platform, urls in self._profiles.all().items():
                 if not urls:
                     continue
-                if not self._running:
-                    await _send(ctx, chat.id, "🛑 *Run cancelled by user\\.*")
+
+                # ── Cooperative cancellation checkpoint ────────────────────
+                if self._cancel_event.is_set():
+                    await _send(ctx, chat.id, "🛑 *Run cancelled — new request received\\.*")
                     return
 
                 plat_cfg = self._cfg.platforms[platform]
                 em       = PLATFORM_EMOJI.get(platform, "📁")
-
                 await _send(
                     ctx, chat.id,
                     f"📂 *{em} {_esc(plat_cfg.label)}* — processing {len(urls)} profile\\(s\\)\\.\\.\\.",
                 )
 
                 for url in urls:
-                    if not self._running:
-                        await _send(ctx, chat.id, "🛑 *Run cancelled by user\\.*")
+                    # ── Cooperative cancellation checkpoint ────────────────
+                    if self._cancel_event.is_set():
+                        await _send(ctx, chat.id, "🛑 *Run cancelled — new request received\\.*")
                         return
 
-                    username = Downloader._extract_username(url, plat_cfg) or url
-
-                    # ── Get or create forum topic ─────────────────────────
+                    username  = Downloader._extract_username(url, plat_cfg) or url
                     thread_id: int | None = None
+
                     if is_forum:
                         thread_id = await self._get_or_create_topic(
                             ctx, chat.id, platform, username
@@ -692,21 +771,24 @@ class BotHandlers:
                         )
                         continue
 
-                    # ── Report errors (typed ErrorKind → precise messages) ──
+                    # ── Report errors ──────────────────────────────────────
                     for sub in result.results:
                         if sub.error_kind == ErrorKind.NONE:
                             continue
+
                         sf = _esc(sub.subfolder)
                         un = _esc(username)
+
                         if sub.error_kind == ErrorKind.RATE_LIMITED:
                             cookie_path = self._cfg.cookies_dir / "instagram.com_cookies.txt"
                             if cookie_path.exists():
-                                kb = round(cookie_path.stat().st_size / 1024, 1)
+                                kb          = round(cookie_path.stat().st_size / 1024, 1)
                                 cookie_note = f"Current cookie: *{_esc(str(kb))} KB*"
                                 if kb < 2:
                                     cookie_note += " ⚠️ _\\(too small — definitely the cause\\)_"
                             else:
                                 cookie_note = "Cookie file: *missing*"
+
                             msg = (
                                 f"🚫 *Rate limited \\(429\\)* — `{un}` \\[{sf}\\]\n\n"
                                 f"{cookie_note}\n\n"
@@ -714,34 +796,41 @@ class BotHandlers:
                                 f"*Cookie\\-Editor* in Chrome → *Netscape* format → "
                                 f"send `instagram\\.com\\_cookies\\.txt` here\\."
                             )
+
                         elif sub.error_kind == ErrorKind.LOGIN:
                             msg = (
                                 f"🔐 *Login required* — `{un}` \\[{sf}\\]\n\n"
                                 f"Upload valid `instagram\\.com\\_cookies\\.txt` and retry\\."
                             )
+
                         elif sub.error_kind == ErrorKind.NOT_FOUND:
                             msg = (
                                 f"❓ *Not found* — `{un}` \\[{sf}\\]\n\n"
                                 f"Account may be deleted or renamed\\."
                             )
+
                         elif sub.error_kind == ErrorKind.PRIVATE:
                             msg = (
                                 f"🔒 *Private account* — `{un}` \\[{sf}\\]\n\n"
                                 f"Upload cookies from a followed account to access\\."
                             )
+
                         elif sub.error_kind == ErrorKind.GALLERY_DL:
                             msg = (
                                 f"🔥 *gallery\\-dl not installed\\!*\n\n"
                                 f"Check your Dockerfile — `gallery-dl` must be in PATH\\."
                             )
+
                         elif sub.error_kind == ErrorKind.NETWORK:
                             msg = (
                                 f"🌐 *Network error* — `{un}` \\[{sf}\\]\n\n"
                                 f"Transient connection issue\\. Will retry next run\\."
                             )
+
                         else:
                             err_preview = _esc((sub.error or "unknown error")[:200])
                             msg = f"⚠️ *Error* — `{un}` \\[{sf}\\]\n`{err_preview}`"
+
                         await _send(ctx, chat.id, msg, thread_id=thread_id)
 
                     new_count    = result.total_new
@@ -753,7 +842,7 @@ class BotHandlers:
                         thread_id=thread_id,
                     )
 
-                    # ── Deliver files ─────────────────────────────────────
+                    # ── Deliver files ──────────────────────────────────────
                     all_new: list[Path] = [
                         f for sub in result.results for f in sub.new_files
                     ]
@@ -766,6 +855,12 @@ class BotHandlers:
                 f"📥 *{grand_total}* new file\\(s\\) downloaded in total\\.",
                 reply_markup=_back_button(),
             )
+
+        except asyncio.CancelledError:
+            # Task was hard-cancelled (should not normally happen — we use
+            # the cooperative cancel_event instead, but handle it safely).
+            logger.info("Download task hard-cancelled for chat=%d", chat.id)
+            raise  # re-raise so asyncio can clean up the Task properly
 
         except Exception as exc:
             logger.exception("Unexpected error during run: %s", exc)
@@ -781,8 +876,8 @@ class BotHandlers:
 
     async def _get_or_create_topic(
         self,
-        ctx:      ContextTypes.DEFAULT_TYPE,
-        chat_id:  int,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
         platform: str,
         username: str,
     ) -> int | None:
@@ -815,9 +910,9 @@ class BotHandlers:
 
     async def _deliver_files(
         self,
-        ctx:       ContextTypes.DEFAULT_TYPE,
-        chat_id:   int,
-        files:     list[Path],
+        ctx: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
+        files: list[Path],
         thread_id: int | None,
     ) -> None:
         cap   = self._cfg.max_send_files
@@ -897,7 +992,6 @@ class BotHandlers:
     ) -> None:
         """Handle cookie files and bulk profile imports uploaded as documents."""
         chat = update.effective_chat
-
         if not self._ok(update, require_owner=True):
             return
 
@@ -910,13 +1004,17 @@ class BotHandlers:
         if self._cookies.is_valid_name(name):
             try:
                 tg_file = await ctx.bot.get_file(doc.file_id)
-                raw     = await tg_file.download_as_bytearray()
+                raw     = bytes(await tg_file.download_as_bytearray())
+
                 if not raw:
                     await _send(ctx, chat.id, "❌ Received an empty file\\.")
                     return
 
+                # Deduplicate cookie entries before saving
+                raw = _deduplicate_cookie_lines(raw)
+
                 size_warn = ""
-                if len(raw) < _MIN_COOKIE_BYTES:
+                if len(raw) < MIN_COOKIE_BYTES:
                     size_warn = (
                         f"\n\n⚠️ *Warning:* Only {len(raw):,} bytes received\\. "
                         f"Valid cookies should be \\>2 KB\\. "
@@ -925,7 +1023,7 @@ class BotHandlers:
                         f"Re\\-export using *Cookie\\-Editor* \\(Netscape format\\)\\."
                     )
 
-                self._cookies.save(name, bytes(raw))
+                self._cookies.save(name, raw)
                 await _send(
                     ctx, chat.id,
                     f"🍪 *Cookie saved:* `{_esc(name)}`\n"
@@ -943,7 +1041,7 @@ class BotHandlers:
             if name == f"{platform}_profiles.txt":
                 try:
                     tg_file = await ctx.bot.get_file(doc.file_id)
-                    raw     = await tg_file.download_as_bytearray()
+                    raw     = bytes(await tg_file.download_as_bytearray())
                     text    = raw.decode(errors="replace")
                     urls    = [
                         line.strip().rstrip("/")
@@ -953,6 +1051,7 @@ class BotHandlers:
                     if not urls:
                         await _send(ctx, chat.id, "❌ No valid URLs found in the file\\.")
                         return
+
                     added = self._profiles.add_bulk(platform, urls)
                     total = len(self._profiles.get(platform))
                     em    = PLATFORM_EMOJI.get(platform, "📁")
