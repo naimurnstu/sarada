@@ -2,10 +2,12 @@
 handlers.py — All Telegram command, callback, and document handlers.
 
 Access model:
-  • Private chat    → owner only
-  • Group (listed)  → anyone can: /run /list /status /cookies /start
-                      owner only: /add /remove /clear /allowgroup /denygroup
-  • Topics (forum)  → each username gets its own topic thread
+  • Private chat              → owner only
+  • Group (not whitelisted)   → owner sees "Allow This Group" button only
+                                non-owner → complete silence
+  • Group (whitelisted)       → anyone: /start /run /list /status /cookies
+                                owner only: /add /remove /clear /allowgroup /denygroup
+  • Topics (forum groups)     → each username gets its own topic thread, reused on next run
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 # ── Platform metadata ──────────────────────────────────────────────────────────
 
 PLATFORM_EMOJI: dict[str, str] = {
@@ -42,21 +45,24 @@ PLATFORM_EMOJI: dict[str, str] = {
     "x":         "🐦",
 }
 
-# Valid icon_color values for create_forum_topic
 TOPIC_COLORS: dict[str, int] = {
-    "instagram": 0xFF93B2,   # rose
-    "tiktok":    0xFB6F5F,   # red-orange
-    "facebook":  0x6FB9F0,   # sky-blue
-    "x":         0xCB86DB,   # purple
+    "instagram": 0xFF93B2,
+    "tiktok":    0xFB6F5F,
+    "facebook":  0x6FB9F0,
+    "x":         0xCB86DB,
 }
+
+# Warn if cookie file is below this size — valid cookies are usually 3–10 KB+
+_MIN_COOKIE_BYTES: int = 2_000
+
 
 # ── Markup builders ────────────────────────────────────────────────────────────
 
 def _main_menu(is_owner: bool) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton("▶️ Photos",  callback_data="run:photos"),
-            InlineKeyboardButton("▶️ Videos",  callback_data="run:videos"),
+            InlineKeyboardButton("📸 Photos",  callback_data="run:photos"),
+            InlineKeyboardButton("🎬 Videos",  callback_data="run:videos"),
             InlineKeyboardButton("📦 Both",    callback_data="run:both"),
         ],
         [
@@ -65,18 +71,25 @@ def _main_menu(is_owner: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🍪 Cookies",  callback_data="menu:cookies"),
         ],
         [
-            InlineKeyboardButton("❌ Cancel Run", callback_data="menu:cancel"),
+            InlineKeyboardButton("🛑 Stop Download", callback_data="menu:cancel"),
         ],
     ]
     if is_owner:
         rows.append([
             InlineKeyboardButton("✅ Allow This Group", callback_data="grp:allow_here"),
-            InlineKeyboardButton("📋 My Groups",        callback_data="grp:list"),
+            InlineKeyboardButton("🏘 My Groups",        callback_data="grp:list"),
         ])
         rows.append([
             InlineKeyboardButton("🗑 Remove a Group", callback_data="grp:remove_prompt"),
         ])
     return InlineKeyboardMarkup(rows)
+
+
+def _whitelist_prompt() -> InlineKeyboardMarkup:
+    """Shown to owner when they /start in a non-whitelisted group."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Activate This Group", callback_data="grp:allow_here"),
+    ]])
 
 
 def _back_button() -> InlineKeyboardMarkup:
@@ -95,13 +108,13 @@ def _esc(text: str) -> str:
 
 
 async def _send(
-    ctx:       ContextTypes.DEFAULT_TYPE,
-    chat_id:   int,
-    text:      str,
-    thread_id: int | None = None,
+    ctx:          ContextTypes.DEFAULT_TYPE,
+    chat_id:      int,
+    text:         str,
+    thread_id:    int | None = None,
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
-    """Send a MarkdownV2 message, optionally to a forum topic thread."""
+    """Send a MarkdownV2 message, optionally into a forum topic thread."""
     try:
         await ctx.bot.send_message(
             chat_id=chat_id,
@@ -133,7 +146,7 @@ class BotHandlers:
         self._dl       = Downloader(cfg)
         self._running  = False
 
-    # ── Access guard ──────────────────────────────────────────────────────────
+    # ── Access helpers ────────────────────────────────────────────────────────
 
     def _ok(self, update: Update, require_owner: bool = False) -> bool:
         return auth.check(update, require_owner=require_owner)
@@ -142,29 +155,42 @@ class BotHandlers:
         u = update.effective_user
         return u is not None and auth.is_owner(u.id)
 
-    # ── /start ────────────────────────────────────────────────────────────────
+    # ── /start & /help ────────────────────────────────────────────────────────
 
     async def cmd_start(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        chat = update.effective_chat
-        user = update.effective_user
-
-        # Groups: must be whitelisted (no require_owner check here — /start is public-ish)
-        if chat.type != ChatType.PRIVATE and not auth.is_group_allowed(chat.id):
-            return
-
+        chat     = update.effective_chat
         is_owner = self._user_is_owner(update)
-        markup   = _main_menu(is_owner)
 
-        text = (
-            "🤖 *Social Media Downloader*\n\n"
-            "📌 *How to use:*\n"
+        # ── Group access logic ─────────────────────────────────────────────
+        if chat.type != ChatType.PRIVATE:
+            is_allowed = auth.is_group_allowed(chat.id)
+
+            # Non-owner in non-whitelisted group → complete silence
+            if not is_owner and not is_allowed:
+                return
+
+            # Owner in non-whitelisted group → activation prompt only
+            if is_owner and not is_allowed:
+                await _send(
+                    ctx, chat.id,
+                    "⚙️ *Bot not activated in this group yet\\.*\n\n"
+                    "Tap below to activate it — members will then be able to use it here\\.",
+                    reply_markup=_whitelist_prompt(),
+                )
+                return
+
+        # ── Full menu ──────────────────────────────────────────────────────
+        markup = _main_menu(is_owner)
+        text   = (
+            "🎯 *SayFalse Media Bot*\n\n"
+            "📥 *Quick Start:*\n"
             "1\\. Send `instagram\\_profiles\\.txt` to import profiles\n"
-            "2\\. Send `instagram\\.com\\_cookies\\.txt` to add cookies\n"
-            "3\\. Press *▶️ Run* to start downloading\n\n"
-            "📂 *Platforms:* Instagram · TikTok · Facebook · X\n\n"
-            "⬇️ Choose an action below:"
+            "2\\. Send `instagram\\.com\\_cookies\\.txt` to add cookies \\(\\>2 KB\\)\n"
+            "3\\. Tap *📸 Photos*, *🎬 Videos*, or *📦 Both*\n\n"
+            "🌐 *Platforms:* Instagram · TikTok · Facebook · X\n\n"
+            "⬇️ *Choose an action:*"
         )
         await _send(ctx, chat.id, text, reply_markup=markup)
 
@@ -176,13 +202,21 @@ class BotHandlers:
         query = update.callback_query
         await query.answer()
 
-        chat = update.effective_chat
-        data = query.data or ""
+        chat     = update.effective_chat
+        data     = query.data or ""
+        is_owner = self._user_is_owner(update)
 
-        # Group whitelist check (private is owner-only via _ok)
-        if chat.type != ChatType.PRIVATE and not auth.is_group_allowed(chat.id):
-            return
+        # ── Group access guard ─────────────────────────────────────────────
+        if chat.type != ChatType.PRIVATE:
+            is_allowed = auth.is_group_allowed(chat.id)
+            if not is_allowed:
+                # Only allow the owner to tap "Activate This Group"
+                if data == "grp:allow_here" and is_owner:
+                    pass  # fall through
+                else:
+                    return  # silence everything else
 
+        # ── Route callbacks ────────────────────────────────────────────────
         if data.startswith("run:"):
             mode = MediaMode.from_str(data.split(":")[1])
             await self._execute_run(update, ctx, mode)
@@ -203,28 +237,28 @@ class BotHandlers:
             await self.cmd_start(update, ctx)
 
         elif data == "grp:allow_here":
-            if not self._user_is_owner(update):
+            if not is_owner:
                 return
             await self._cb_allow_here(update, ctx)
 
         elif data == "grp:list":
-            if not self._user_is_owner(update):
+            if not is_owner:
                 return
             await self._cb_groups_list(update, ctx)
 
         elif data == "grp:remove_prompt":
-            if not self._user_is_owner(update):
+            if not is_owner:
                 return
             await self._cb_remove_group_prompt(update, ctx)
 
         elif data.startswith("grp:deny:"):
-            if not self._user_is_owner(update):
+            if not is_owner:
                 return
             gid = int(data.split(":")[2])
             self._groups.deny(gid)
             await _send(
                 ctx, chat.id,
-                f"🗑 Group `{_esc(str(gid))}` removed from whitelist\\.",
+                f"🗑 Group `{_esc(str(gid))}` removed\\.",
                 reply_markup=_back_button(),
             )
 
@@ -250,21 +284,26 @@ class BotHandlers:
             lines.append(f"\n_Total: {total} profile\\(s\\)_")
             text = "\n".join(lines)
         else:
-            text = "📭 No profiles queued\\.\n\nSend `instagram\\_profiles\\.txt` to import\\."
-
+            text = (
+                "📭 *No profiles queued\\.*\n\n"
+                "Send `instagram\\_profiles\\.txt` to import, or use `/add`\\."
+            )
         await _send(ctx, chat.id, text, reply_markup=_back_button())
 
     async def _cb_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        chat      = update.effective_chat
-        profiles  = self._profiles.all()
-        cookies   = self._cookies.list_all()
+        chat       = update.effective_chat
+        profiles   = self._profiles.all()
+        cookies    = self._cookies.list_all()
         plat_count = sum(1 for v in profiles.values() if v)
         total      = self._profiles.total_count()
-        state      = "🔄 Download in progress" if self._running else "⏸ Idle"
-
+        state      = (
+            "🔄 *Running* — download in progress"
+            if self._running else
+            "✅ *Idle* — ready"
+        )
         lines = [
-            f"*📊 Status*\n",
-            f"*State:* {_esc(state)}",
+            "*📊 Bot Status*\n",
+            f"*State:* {state}",
             f"*Active platforms:* {plat_count}",
             f"*Profiles queued:* {total}",
             f"*Cookie files:* {len(cookies)}",
@@ -274,22 +313,27 @@ class BotHandlers:
     async def _cb_cookies(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         chat   = update.effective_chat
         stored = self._cookies.list_all()
+        lines  = ["*🍪 Cookie Files*\n"]
 
-        lines = ["*🍪 Cookie Files*\n"]
         if stored:
             for name, size in stored:
-                kb = size / 1024
-                lines.append(f"✅ `{_esc(name)}` — {kb:.1f} KB")
+                kb   = size / 1024
+                warn = " ⚠️ _too small — may be invalid_" if size < _MIN_COOKIE_BYTES else ""
+                lines.append(f"✅ `{_esc(name)}` — {kb:.1f} KB{warn}")
         else:
             lines.append("_No cookies uploaded yet\\._")
 
         lines += [
             "",
-            "*How to upload:*",
-            "1\\. Export cookies from your browser",
-            "   \\(use a Netscape cookies extension\\)",
-            "2\\. Send the file directly to this chat",
-            "   e\\.g\\. `instagram\\.com\\_cookies\\.txt`",
+            "*📤 How to export valid cookies:*",
+            "1\\. Install *Cookie\\-Editor* extension in Chrome/Firefox",
+            "2\\. Log in to Instagram \\(or TikTok etc\\.\\) in your browser",
+            "3\\. Open Cookie\\-Editor → *Export* → choose *Netscape* format",
+            "4\\. Save as `instagram\\.com\\_cookies\\.txt`",
+            "5\\. Send the file here \\(should be \\>2 KB\\)",
+            "",
+            "_A file smaller than 2 KB likely has missing session cookies_",
+            "_and gallery\\-dl will get a 429 or login error\\._",
         ]
         await _send(ctx, chat.id, "\n".join(lines), reply_markup=_back_button())
 
@@ -301,7 +345,7 @@ class BotHandlers:
         self._running = False
         await _send(
             ctx, chat.id,
-            "⚠️ Cancel requested\\. Current profile will finish, then the run stops\\.",
+            "🛑 *Stop requested\\.* Current profile will finish, then the run stops\\.",
             reply_markup=_back_button(),
         )
 
@@ -310,17 +354,21 @@ class BotHandlers:
         if chat.type == ChatType.PRIVATE:
             await _send(
                 ctx, chat.id,
-                "ℹ️ Use this button *inside the group* you want to allow\\.",
+                "ℹ️ Press *✅ Allow This Group* from *inside the group* you want to activate\\.",
                 reply_markup=_back_button(),
             )
             return
         added = self._groups.allow(chat.id)
-        msg   = (
-            f"✅ Group `{_esc(str(chat.id))}` added to whitelist\\."
-            if added
-            else f"ℹ️ Group `{_esc(str(chat.id))}` already whitelisted\\."
-        )
-        await _send(ctx, chat.id, msg, reply_markup=_back_button())
+        if added:
+            msg = (
+                f"✅ *Group activated\\!*\n\n"
+                f"Group ID: `{_esc(str(chat.id))}`\n\n"
+                f"Members can now use the bot here\\.\n"
+                f"Send /start to see the full menu\\."
+            )
+        else:
+            msg = "ℹ️ This group is already activated\\."
+        await _send(ctx, chat.id, msg)
 
     async def _cb_groups_list(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -328,17 +376,20 @@ class BotHandlers:
         if not ids:
             await _send(
                 ctx, chat.id,
-                "📭 No groups whitelisted yet\\.\n"
-                "Add the bot to a group and press *✅ Allow This Group*\\.",
+                "📭 *No groups activated yet\\.*\n\n"
+                "Add the bot to a group, send /start there as the owner, "
+                "then tap *✅ Allow This Group*\\.",
                 reply_markup=_back_button(),
             )
             return
-        lines = ["*⚙️ Whitelisted Groups*\n"]
+        lines = ["*🏘 Activated Groups*\n"]
         for gid in ids:
             lines.append(f"• `{_esc(str(gid))}`")
         await _send(ctx, chat.id, "\n".join(lines), reply_markup=_back_button())
 
-    async def _cb_remove_group_prompt(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _cb_remove_group_prompt(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
         chat = update.effective_chat
         ids  = self._groups.list_all()
         if not ids:
@@ -363,14 +414,16 @@ class BotHandlers:
         if not ctx.args or len(ctx.args) < 2:
             await _send(
                 ctx, update.effective_chat.id,
-                "Usage: `/add <platform> <url>`\n\nPlatforms: `instagram` `tiktok` `facebook` `x`",
+                "📝 *Usage:* `/add <platform> <url>`\n\n"
+                "Platforms: `instagram` `tiktok` `facebook` `x`\n\n"
+                "*Example:*\n`/add instagram https://www.instagram.com/username`",
             )
             return
         platform = ctx.args[0].lower().strip()
         url      = ctx.args[1].strip().rstrip("/")
         if platform not in self._cfg.platforms:
             plat_list = _esc(", ".join(self._cfg.platforms))
-            await _send(ctx, update.effective_chat.id, f"❌ Unknown platform\\. Use: {plat_list}")
+            await _send(ctx, update.effective_chat.id, f"❌ Unknown platform\\. Valid: {plat_list}")
             return
         if not url.startswith("http"):
             await _send(ctx, update.effective_chat.id, "❌ URL must start with `http`\\.")
@@ -379,7 +432,7 @@ class BotHandlers:
         username = Downloader._extract_username(url, plat_cfg) or url
         added    = self._profiles.add(platform, url)
         em       = PLATFORM_EMOJI.get(platform, "📁")
-        msg = (
+        msg      = (
             f"✅ Added `{_esc(username)}` → *{em} {_esc(platform)}*"
             if added else
             "ℹ️ Already in queue\\."
@@ -410,7 +463,6 @@ class BotHandlers:
     async def cmd_list(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._ok(update):
             return
-        # Reuse callback implementation
         await self._cb_list(update, ctx)
 
     # ── /clear ────────────────────────────────────────────────────────────────
@@ -439,35 +491,33 @@ class BotHandlers:
             return
         chat = update.effective_chat
 
-        # Called with an ID argument: /allowgroup -1001234567
         if ctx.args:
             try:
                 gid   = int(ctx.args[0])
                 added = self._groups.allow(gid)
                 await _send(
                     ctx, chat.id,
-                    f"✅ Group `{_esc(str(gid))}` whitelisted\\."
+                    f"✅ Group `{_esc(str(gid))}` activated\\."
                     if added else
-                    f"ℹ️ Group `{_esc(str(gid))}` already in list\\.",
+                    f"ℹ️ Group `{_esc(str(gid))}` already active\\.",
                 )
             except ValueError:
-                await _send(ctx, chat.id, "❌ Invalid group ID\\. Must be a number\\.")
+                await _send(ctx, chat.id, "❌ Invalid group ID \\(must be a number\\)\\.")
             return
 
-        # Called inside the group itself with no argument
         if chat.type == ChatType.PRIVATE:
             await _send(
                 ctx, chat.id,
-                "Use `/allowgroup <group\\_id>` or run this command *inside the group*\\.",
+                "Use `/allowgroup <group\\_id>` or run this inside the group itself\\.",
             )
             return
 
         added = self._groups.allow(chat.id)
         await _send(
             ctx, chat.id,
-            f"✅ This group \\(`{_esc(str(chat.id))}`\\) is now whitelisted\\."
+            f"✅ This group \\(`{_esc(str(chat.id))}`\\) is now activated\\."
             if added else
-            "ℹ️ This group is already whitelisted\\.",
+            "ℹ️ Already activated\\.",
         )
 
     # ── /denygroup ────────────────────────────────────────────────────────────
@@ -539,7 +589,7 @@ class BotHandlers:
         if self._running:
             await _send(
                 ctx, chat.id,
-                "⚠️ A download is already running\\. Use *❌ Cancel Run* first\\.",
+                "⚠️ A download is already running\\. Use *🛑 Stop Download* to cancel first\\.",
                 reply_markup=_back_button(),
             )
             return
@@ -548,20 +598,22 @@ class BotHandlers:
         if total == 0:
             await _send(
                 ctx, chat.id,
-                "📭 No profiles queued\\.\n\n"
+                "📭 *No profiles queued\\.*\n\n"
                 "Send `instagram\\_profiles\\.txt` to the chat to import, or use `/add`\\.",
                 reply_markup=_back_button(),
             )
             return
 
-        is_forum   = getattr(chat, "is_forum", False)
+        is_forum      = getattr(chat, "is_forum", False)
         self._running = True
 
         try:
             await _send(
                 ctx, chat.id,
-                f"🚀 *Starting* \\[{_esc(mode.label())}\\]\n"
-                f"_{total} profile\\(s\\) queued\\.\\.\\._",
+                f"🚀 *Download started*\n"
+                f"Mode: *{_esc(mode.label())}*\n"
+                f"Profiles: *{total}*\n\n"
+                f"_This may take a while — Instagram can be slow\\.\\.\\._",
             )
 
             grand_total = 0
@@ -570,21 +622,20 @@ class BotHandlers:
                 if not urls:
                     continue
                 if not self._running:
-                    await _send(ctx, chat.id, "🛑 Run cancelled\\.")
+                    await _send(ctx, chat.id, "🛑 *Run cancelled\\.*")
                     return
 
                 plat_cfg = self._cfg.platforms[platform]
                 em       = PLATFORM_EMOJI.get(platform, "📁")
 
-                # Platform header in main thread
                 await _send(
                     ctx, chat.id,
-                    f"\n📂 *{em} {_esc(plat_cfg.label)}*",
+                    f"📂 *{em} {_esc(plat_cfg.label)}* — {len(urls)} profile\\(s\\)",
                 )
 
                 for url in urls:
                     if not self._running:
-                        await _send(ctx, chat.id, "🛑 Run cancelled\\.")
+                        await _send(ctx, chat.id, "🛑 *Run cancelled\\.*")
                         return
 
                     username = Downloader._extract_username(url, plat_cfg) or url
@@ -596,40 +647,54 @@ class BotHandlers:
                             ctx, chat.id, platform, username
                         )
 
-                    # Announce in topic (or main thread)
                     await _send(
                         ctx, chat.id,
-                        f"▶️ `{_esc(username)}`",
+                        f"⏳ Downloading `{_esc(username)}`\\.\\.\\.",
                         thread_id=thread_id,
                     )
 
-                    # ── Download ──────────────────────────────────────────
                     result = await self._dl.download_user(url, plat_cfg, mode)
 
                     if result.skipped:
                         await _send(
                             ctx, chat.id,
-                            f"⚠️ Skipped: _{_esc(result.skip_reason)}_",
+                            f"⚠️ Skipped `{_esc(username)}`: _{_esc(result.skip_reason)}_",
                             thread_id=thread_id,
                         )
                         continue
 
-                    # Report archive status per subfolder
+                    # ── Report errors ──────────────────────────────────────
                     for sub in result.results:
-                        line = (
-                            f"  `\\[{_esc(sub.subfolder)}\\]` "
-                            f"archive: {_esc(sub.archive_action)}"
-                        )
-                        if sub.error:
-                            line += f"\n  ⚠️ `{_esc(sub.error[:200])}`"
-                        await _send(ctx, chat.id, line, thread_id=thread_id)
+                        if not sub.error:
+                            continue
+                        err = sub.error
+                        if "429" in err:
+                            msg = (
+                                f"🚫 *Rate limited \\(429\\)* on `{_esc(username)}` "
+                                f"\\[{_esc(sub.subfolder)}\\]\n\n"
+                                f"_Instagram blocked the request\\. "
+                                f"Your cookies may be expired or too small\\. "
+                                f"Re\\-export fresh cookies \\(\\>2 KB\\) and retry\\._"
+                            )
+                        elif "login" in err.lower() or "unauthorized" in err.lower():
+                            msg = (
+                                f"🔐 *Login required* for `{_esc(username)}` "
+                                f"\\[{_esc(sub.subfolder)}\\]\n\n"
+                                f"_Upload valid cookies and retry\\._"
+                            )
+                        else:
+                            msg = (
+                                f"⚠️ `{_esc(username)}` \\[{_esc(sub.subfolder)}\\]: "
+                                f"`{_esc(err[:250])}`"
+                            )
+                        await _send(ctx, chat.id, msg, thread_id=thread_id)
 
-                    new_count = result.total_new
+                    new_count    = result.total_new
                     grand_total += new_count
 
                     await _send(
                         ctx, chat.id,
-                        f"✅ `{_esc(username)}` — {new_count} new file\\(s\\)",
+                        f"✅ `{_esc(username)}` — *{new_count}* new file\\(s\\)",
                         thread_id=thread_id,
                     )
 
@@ -641,7 +706,8 @@ class BotHandlers:
 
             await _send(
                 ctx, chat.id,
-                f"🏁 *All done* — {grand_total} new file\\(s\\) total\\.",
+                f"🏁 *All done\\!*\n\n"
+                f"📥 *{grand_total}* new file\\(s\\) downloaded total\\.",
                 reply_markup=_back_button(),
             )
 
@@ -649,7 +715,7 @@ class BotHandlers:
             logger.exception("Unexpected error during run: %s", exc)
             await _send(
                 ctx, chat.id,
-                f"🔥 Internal error: `{_esc(str(exc)[:200])}`",
+                f"🔥 *Unexpected error:*\n`{_esc(str(exc)[:300])}`",
                 reply_markup=_back_button(),
             )
         finally:
@@ -664,7 +730,6 @@ class BotHandlers:
         platform: str,
         username: str,
     ) -> int | None:
-        """Return existing topic thread_id or create a new one."""
         stored = self._topics.get(chat_id, platform, username)
         if stored is not None:
             return stored
@@ -674,7 +739,7 @@ class BotHandlers:
         topic_name = f"{em} {username}"[:128]
 
         try:
-            topic = await ctx.bot.create_forum_topic(
+            topic     = await ctx.bot.create_forum_topic(
                 chat_id=chat_id,
                 name=topic_name,
                 icon_color=color,
@@ -709,7 +774,8 @@ class BotHandlers:
                 if remaining > 0:
                     await _send(
                         ctx, chat_id,
-                        f"ℹ️ {remaining} more file\\(s\\) saved to disk \\(cap of {cap} reached\\)\\.",
+                        f"ℹ️ {remaining} more file\\(s\\) saved to disk "
+                        f"\\(cap of {cap} reached\\)\\.",
                         thread_id=thread_id,
                     )
                 break
@@ -722,8 +788,8 @@ class BotHandlers:
             if size_mb > limit:
                 await _send(
                     ctx, chat_id,
-                    f"⚠️ `{_esc(path.name)}` is {size_mb:.1f} MB — "
-                    f"too large for Telegram \\(max {limit} MB\\), saved to disk\\.",
+                    f"⚠️ `{_esc(path.name)}` — {size_mb:.1f} MB "
+                    f"\\(too large for Telegram, saved to disk\\)\\.",
                     thread_id=thread_id,
                 )
                 continue
@@ -751,7 +817,7 @@ class BotHandlers:
                         )
                 sent += 1
             except TelegramError:
-                # Fallback: send as document
+                # Fallback: send as generic document
                 try:
                     with path.open("rb") as fh:
                         await ctx.bot.send_document(
@@ -763,23 +829,24 @@ class BotHandlers:
                 except TelegramError as exc:
                     logger.warning("Could not send %s: %s", path.name, exc)
 
-        logger.info("Delivered %d/%d file(s) to chat=%d thread=%s", sent, len(files), chat_id, thread_id)
+        logger.info(
+            "Delivered %d/%d file(s) to chat=%d thread=%s",
+            sent, len(files), chat_id, thread_id,
+        )
 
     # ── Document upload handler ───────────────────────────────────────────────
 
     async def handle_document(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle cookie file and bulk profile imports sent as documents."""
+        """Handle cookie files and bulk profile imports uploaded as documents."""
         chat = update.effective_chat
 
-        # Group: must be whitelisted. Cookie/profile upload: owner only.
         if not self._ok(update, require_owner=True):
             return
 
         doc  = update.message.document
         name = (doc.file_name or "").strip()
-
         if not name:
             return
 
@@ -789,18 +856,30 @@ class BotHandlers:
                 tg_file = await ctx.bot.get_file(doc.file_id)
                 raw     = await tg_file.download_as_bytearray()
                 if not raw:
-                    await _send(ctx, chat.id, "❌ Received empty file\\.")
+                    await _send(ctx, chat.id, "❌ Received an empty file\\.")
                     return
+
+                size_warn = ""
+                if len(raw) < _MIN_COOKIE_BYTES:
+                    size_warn = (
+                        f"\n\n⚠️ *Warning:* Only {len(raw):,} bytes received\\. "
+                        f"Valid cookies should be \\>2 KB\\. "
+                        f"This file likely has missing session cookies — "
+                        f"Instagram will return *429* or refuse auth\\. "
+                        f"Re\\-export using Cookie\\-Editor \\(Netscape format\\)\\."
+                    )
+
                 self._cookies.save(name, bytes(raw))
                 await _send(
                     ctx, chat.id,
-                    f"🍪 Cookie saved: `{_esc(name)}` \\({len(raw):,} bytes\\)\n\n"
-                    f"Use *▶️ Run* to start downloading\\.",
+                    f"🍪 *Cookie saved:* `{_esc(name)}`\n"
+                    f"Size: {len(raw):,} bytes{size_warn}\n\n"
+                    f"Tap below to start downloading\\.",
                     reply_markup=_main_menu(self._user_is_owner(update)),
                 )
             except (TelegramError, OSError) as exc:
                 logger.error("Cookie upload failed: %s", exc)
-                await _send(ctx, chat.id, f"❌ Failed to save cookie: `{_esc(str(exc)[:150])}`")
+                await _send(ctx, chat.id, f"❌ Failed to save: `{_esc(str(exc)[:150])}`")
             return
 
         # ── Bulk profile import ────────────────────────────────────────────
@@ -823,9 +902,9 @@ class BotHandlers:
                     em    = PLATFORM_EMOJI.get(platform, "📁")
                     await _send(
                         ctx, chat.id,
-                        f"📋 Added *{added}* profile\\(s\\) to "
-                        f"{em} *{_esc(platform)}* \\({total} total\\)\n\n"
-                        f"Press *▶️ Run* to start downloading\\.",
+                        f"📋 *Imported {added} profile\\(s\\)* into {em} *{_esc(platform)}*\n"
+                        f"Total queued: *{total}*\n\n"
+                        f"Tap below to start downloading\\.",
                         reply_markup=_main_menu(self._user_is_owner(update)),
                     )
                 except (TelegramError, OSError) as exc:
@@ -835,28 +914,28 @@ class BotHandlers:
 
         await _send(
             ctx, chat.id,
-            f"❓ Unrecognised file: `{_esc(name)}`\n\n"
-            "*Expected files:*\n"
+            f"❓ *Unrecognised file:* `{_esc(name)}`\n\n"
+            "*Expected filenames:*\n"
             "`instagram\\.com\\_cookies\\.txt`\n"
             "`tiktok\\.com\\_cookies\\.txt`\n"
             "`instagram\\_profiles\\.txt`\n"
-            "`tiktok\\_profiles\\.txt`  etc\\.",
+            "`tiktok\\_profiles\\.txt` etc\\.",
         )
 
 
-# ── Bot commands list (for Telegram "/" menu) ─────────────────────────────────
+# ── Bot commands list (shown in Telegram "/" menu) ─────────────────────────────
 
 BOT_COMMANDS: list[BotCommand] = [
     BotCommand("start",       "Show main menu"),
-    BotCommand("run",         "Start download [photos|videos|both]"),
+    BotCommand("run",         "Download [photos|videos|both]"),
     BotCommand("add",         "Add a profile: /add <platform> <url>"),
-    BotCommand("remove",      "Remove a profile: /remove <platform> <url>"),
+    BotCommand("remove",      "Remove a profile"),
     BotCommand("list",        "Show all queued profiles"),
-    BotCommand("clear",       "Clear a platform: /clear <platform>"),
-    BotCommand("status",      "Show queue summary and run state"),
+    BotCommand("clear",       "Clear a platform queue"),
+    BotCommand("status",      "Bot status and queue summary"),
     BotCommand("cookies",     "List uploaded cookie files"),
     BotCommand("cancel",      "Stop an ongoing download"),
-    BotCommand("allowgroup",  "Whitelist a group: /allowgroup [group_id]"),
-    BotCommand("denygroup",   "Remove a group: /denygroup <group_id>"),
-    BotCommand("groups",      "List all whitelisted groups"),
+    BotCommand("allowgroup",  "Activate bot in this group"),
+    BotCommand("denygroup",   "Remove a group"),
+    BotCommand("groups",      "List all activated groups"),
 ]
