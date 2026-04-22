@@ -1,69 +1,80 @@
 """
-auth.py — Owner-only access control decorator.
+auth.py — Access control helpers.
 
-Usage:
-    @owner_only
-    async def cmd_run(update, ctx): ...
+Rules:
+  Private chat → owner only (always).
+  Group chat   → group must be whitelisted.
+                 Management commands additionally require owner.
 """
 
 from __future__ import annotations
 
-import functools
 import logging
-from typing import Callable
+from typing import TYPE_CHECKING
 
 from telegram import Update
-from telegram.ext import ContextTypes
+
+if TYPE_CHECKING:
+    from storage import GroupStore
 
 logger = logging.getLogger(__name__)
 
-_OWNER_ID: int = 0
+_OWNER_ID:   int          = 0
+_GROUP_STORE: "GroupStore | None" = None
 
 
-def configure(owner_id: int) -> None:
-    """Call once at startup with the owner's Telegram user ID."""
-    global _OWNER_ID
-    _OWNER_ID = owner_id
+def configure(owner_id: int, group_store: "GroupStore") -> None:
+    global _OWNER_ID, _GROUP_STORE
+    _OWNER_ID    = owner_id
+    _GROUP_STORE = group_store
     logger.info("Auth configured — owner_id=%d", owner_id)
 
 
-def owner_only(handler: Callable) -> Callable:
+def is_owner(user_id: int) -> bool:
+    if _OWNER_ID == 0:
+        logger.critical("OWNER_ID not set — treating all users as owner (INSECURE).")
+        return True
+    return user_id == _OWNER_ID
+
+
+def is_group_allowed(chat_id: int) -> bool:
+    if _GROUP_STORE is None:
+        return False
+    return _GROUP_STORE.is_allowed(chat_id)
+
+
+def check(update: Update, require_owner: bool = False) -> bool:
     """
-    Decorator that rejects all users except the configured owner.
-    Silently ignores requests from unknown users (no reply) to avoid
-    leaking that the bot exists to random callers.
+    Central access-control check. Returns True if the update is permitted.
+
+    Private chat:
+        - Always requires owner.
+    Group / supergroup:
+        - Group must be whitelisted.
+        - If require_owner=True, user must also be owner.
     """
-    @functools.wraps(handler)
-    async def wrapper(
-        update: Update,
-        ctx: ContextTypes.DEFAULT_TYPE,
-    ) -> None:
-        user = update.effective_user
+    user = update.effective_user
+    chat = update.effective_chat
 
-        if user is None:
-            logger.warning("Update with no user — rejected.")
-            return
+    if user is None or chat is None:
+        return False
 
-        if _OWNER_ID == 0:
-            # OWNER_ID not configured — fail open with a warning so the
-            # owner can still bootstrap, but log loudly.
-            logger.critical(
-                "OWNER_ID not set! Allowing user %d. Set OWNER_ID env var.",
-                user.id,
-            )
-            await handler(update, ctx)
-            return
+    if chat.type == "private":
+        allowed = is_owner(user.id)
+        if not allowed:
+            logger.warning("PM rejected for user %d (%s)", user.id, user.username)
+        return allowed
 
-        if user.id != _OWNER_ID:
-            logger.warning(
-                "Rejected user %d (%s) attempting '%s'",
-                user.id,
-                user.username or "no-username",
-                update.message.text if update.message else "unknown",
-            )
-            # Silent reject — no response to the unauthorized user
-            return
+    # Group / supergroup / forum
+    if not is_group_allowed(chat.id):
+        logger.debug("Ignoring update from non-whitelisted group %d", chat.id)
+        return False
 
-        await handler(update, ctx)
+    if require_owner and not is_owner(user.id):
+        logger.warning(
+            "Owner-only command rejected: user=%d group=%d",
+            user.id, chat.id,
+        )
+        return False
 
-    return wrapper
+    return True

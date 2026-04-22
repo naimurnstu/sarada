@@ -1,8 +1,11 @@
 """
-handlers.py — All Telegram command and message handlers.
+handlers.py — All Telegram command, callback, and document handlers.
 
-Every handler that mutates state or runs downloads is protected
-by @owner_only. Public handlers (/start, /help) are open.
+Access model:
+  • Private chat    → owner only
+  • Group (listed)  → anyone can: /run /list /status /cookies /start
+                      owner only: /add /remove /clear /allowgroup /denygroup
+  • Topics (forum)  → each username gets its own topic thread
 """
 
 from __future__ import annotations
@@ -11,478 +14,849 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.constants import ChatType, ParseMode
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import ContextTypes
 
-from auth import owner_only
+import auth
 from downloader import Downloader, MediaMode
 
 if TYPE_CHECKING:
     from config import Config
-    from storage import CookieStore, ProfileStore
+    from storage import CookieStore, GroupStore, ProfileStore, TopicStore
 
 logger = logging.getLogger(__name__)
 
-# ── Telegram message helpers ───────────────────────────────────────────────────
+# ── Platform metadata ──────────────────────────────────────────────────────────
 
-async def _reply(update: Update, text: str) -> None:
-    """Send a Markdown reply, truncating at Telegram's 4096-char limit."""
-    try:
-        await update.message.reply_text(
-            text[:4096],
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
-    except TelegramError as exc:
-        logger.error("Failed to send reply: %s", exc)
+PLATFORM_EMOJI: dict[str, str] = {
+    "instagram": "📸",
+    "tiktok":    "🎵",
+    "facebook":  "💙",
+    "x":         "🐦",
+}
 
+# Valid icon_color values for create_forum_topic
+TOPIC_COLORS: dict[str, int] = {
+    "instagram": 0xFF93B2,   # rose
+    "tiktok":    0xFB6F5F,   # red-orange
+    "facebook":  0x6FB9F0,   # sky-blue
+    "x":         0xCB86DB,   # purple
+}
+
+# ── Markup builders ────────────────────────────────────────────────────────────
+
+def _main_menu(is_owner: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("▶️ Photos",  callback_data="run:photos"),
+            InlineKeyboardButton("▶️ Videos",  callback_data="run:videos"),
+            InlineKeyboardButton("📦 Both",    callback_data="run:both"),
+        ],
+        [
+            InlineKeyboardButton("📋 Profiles", callback_data="menu:list"),
+            InlineKeyboardButton("📊 Status",   callback_data="menu:status"),
+            InlineKeyboardButton("🍪 Cookies",  callback_data="menu:cookies"),
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel Run", callback_data="menu:cancel"),
+        ],
+    ]
+    if is_owner:
+        rows.append([
+            InlineKeyboardButton("✅ Allow This Group", callback_data="grp:allow_here"),
+            InlineKeyboardButton("📋 My Groups",        callback_data="grp:list"),
+        ])
+        rows.append([
+            InlineKeyboardButton("🗑 Remove a Group", callback_data="grp:remove_prompt"),
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _back_button() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu:main"),
+    ]])
+
+
+# ── Text helpers ───────────────────────────────────────────────────────────────
 
 def _esc(text: str) -> str:
-    """Escape special MarkdownV2 characters."""
-    for ch in r"_*[]()~`>#+-=|{}.!\\":
+    """Escape MarkdownV2 special characters."""
+    for ch in r"\_*[]()~`>#+-=|{}.!":
         text = text.replace(ch, f"\\{ch}")
     return text
 
 
-async def _send_file(
-    update: Update,
-    path: Path,
-    video_exts: frozenset[str],
-    photo_exts: frozenset[str],
-) -> bool:
-    """
-    Send a file to the chat.
-    Returns True on success, False on failure.
-    """
-    ext = path.suffix.lstrip(".").lower()
+async def _send(
+    ctx:       ContextTypes.DEFAULT_TYPE,
+    chat_id:   int,
+    text:      str,
+    thread_id: int | None = None,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    """Send a MarkdownV2 message, optionally to a forum topic thread."""
     try:
-        with path.open("rb") as fh:
-            if ext in video_exts:
-                await update.message.reply_video(fh)
-            elif ext in photo_exts:
-                await update.message.reply_photo(fh)
-            else:
-                await update.message.reply_document(fh)
-        return True
-    except TelegramError:
-        # Fallback: send as document
-        try:
-            with path.open("rb") as fh:
-                await update.message.reply_document(fh)
-            return True
-        except TelegramError as exc:
-            logger.warning("Could not send %s: %s", path.name, exc)
-            return False
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=text[:4096],
+            parse_mode=ParseMode.MARKDOWN_V2,
+            message_thread_id=thread_id,
+            reply_markup=reply_markup,
+        )
+    except TelegramError as exc:
+        logger.error("send failed chat=%d thread=%s: %s", chat_id, thread_id, exc)
 
 
-# ── Handler class ──────────────────────────────────────────────────────────────
+# ── BotHandlers ────────────────────────────────────────────────────────────────
 
 class BotHandlers:
-    """
-    Encapsulates all bot handlers with injected dependencies.
-    Registered with the Application in bot.py.
-    """
-
     def __init__(
         self,
-        cfg:       "Config",
-        profiles:  "ProfileStore",
-        cookies:   "CookieStore",
+        cfg:      "Config",
+        profiles: "ProfileStore",
+        cookies:  "CookieStore",
+        groups:   "GroupStore",
+        topics:   "TopicStore",
     ) -> None:
         self._cfg      = cfg
         self._profiles = profiles
         self._cookies  = cookies
+        self._groups   = groups
+        self._topics   = topics
         self._dl       = Downloader(cfg)
-        self._running  = False  # Simple re-entrancy guard
+        self._running  = False
+
+    # ── Access guard ──────────────────────────────────────────────────────────
+
+    def _ok(self, update: Update, require_owner: bool = False) -> bool:
+        return auth.check(update, require_owner=require_owner)
+
+    def _user_is_owner(self, update: Update) -> bool:
+        u = update.effective_user
+        return u is not None and auth.is_owner(u.id)
 
     # ── /start ────────────────────────────────────────────────────────────────
 
     async def cmd_start(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        lines = [
-            "🤖 *Social Media Downloader*",
-            "",
-            "*Commands*",
-            "`/add <platform> <url>` — queue a profile",
-            "`/remove <platform> <url>` — remove a profile",
-            "`/list` — show all queued profiles",
-            "`/clear <platform>` — clear all URLs for a platform",
-            "`/cookies` — list uploaded cookie files",
-            "`/run [photos|videos|both]` — start downloading",
-            "`/status` — show queue summary",
-            "`/cancel` — stop ongoing download \\(best effort\\)",
-            "",
-            "*Platforms:* `instagram` · `tiktok` · `facebook` · `x`",
-            "",
-            "*Cookie upload:* send `instagram\\.com\\_cookies\\.txt` etc\\.",
-            "*Bulk import:* send `instagram\\_profiles\\.txt` etc\\.",
-        ]
-        await update.message.reply_text(
-            "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2
+        chat = update.effective_chat
+        user = update.effective_user
+
+        # Groups: must be whitelisted (no require_owner check here — /start is public-ish)
+        if chat.type != ChatType.PRIVATE and not auth.is_group_allowed(chat.id):
+            return
+
+        is_owner = self._user_is_owner(update)
+        markup   = _main_menu(is_owner)
+
+        text = (
+            "🤖 *Social Media Downloader*\n\n"
+            "📌 *How to use:*\n"
+            "1\\. Send `instagram\\_profiles\\.txt` to import profiles\n"
+            "2\\. Send `instagram\\.com\\_cookies\\.txt` to add cookies\n"
+            "3\\. Press *▶️ Run* to start downloading\n\n"
+            "📂 *Platforms:* Instagram · TikTok · Facebook · X\n\n"
+            "⬇️ Choose an action below:"
         )
+        await _send(ctx, chat.id, text, reply_markup=markup)
 
-    # ── /add ─────────────────────────────────────────────────────────────────
+    # ── Callback router ───────────────────────────────────────────────────────
 
-    @owner_only
-    async def cmd_add(
+    async def handle_callback(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        if not ctx.args or len(ctx.args) < 2:
-            await _reply(update, "Usage: `/add <platform> <url>`")
+        query = update.callback_query
+        await query.answer()
+
+        chat = update.effective_chat
+        data = query.data or ""
+
+        # Group whitelist check (private is owner-only via _ok)
+        if chat.type != ChatType.PRIVATE and not auth.is_group_allowed(chat.id):
             return
 
-        platform = ctx.args[0].lower().strip()
-        url      = ctx.args[1].strip().rstrip("/")
+        if data.startswith("run:"):
+            mode = MediaMode.from_str(data.split(":")[1])
+            await self._execute_run(update, ctx, mode)
 
-        if platform not in self._cfg.platforms:
-            plat_list = _esc(", ".join(self._cfg.platforms))
-            await _reply(update, f"❌ Unknown platform\\. Use: {plat_list}")
-            return
+        elif data == "menu:list":
+            await self._cb_list(update, ctx)
 
-        if not url.startswith("http"):
-            await _reply(update, "❌ URL must start with `http`")
-            return
+        elif data == "menu:status":
+            await self._cb_status(update, ctx)
 
-        added = self._profiles.add(platform, url)
-        plat_cfg  = self._cfg.platforms[platform]
-        username  = Downloader._extract_username(url, plat_cfg) or url
+        elif data == "menu:cookies":
+            await self._cb_cookies(update, ctx)
 
-        if added:
-            await _reply(
-                update,
-                f"✅ Added `{_esc(username)}` → *{_esc(platform)}*"
+        elif data == "menu:cancel":
+            await self._cb_cancel(update, ctx)
+
+        elif data == "menu:main":
+            await self.cmd_start(update, ctx)
+
+        elif data == "grp:allow_here":
+            if not self._user_is_owner(update):
+                return
+            await self._cb_allow_here(update, ctx)
+
+        elif data == "grp:list":
+            if not self._user_is_owner(update):
+                return
+            await self._cb_groups_list(update, ctx)
+
+        elif data == "grp:remove_prompt":
+            if not self._user_is_owner(update):
+                return
+            await self._cb_remove_group_prompt(update, ctx)
+
+        elif data.startswith("grp:deny:"):
+            if not self._user_is_owner(update):
+                return
+            gid = int(data.split(":")[2])
+            self._groups.deny(gid)
+            await _send(
+                ctx, chat.id,
+                f"🗑 Group `{_esc(str(gid))}` removed from whitelist\\.",
+                reply_markup=_back_button(),
             )
-        else:
-            await _reply(update, "ℹ️ Already in queue\\.")
 
-    # ── /remove ───────────────────────────────────────────────────────────────
+    # ── Inline callback implementations ───────────────────────────────────────
 
-    @owner_only
-    async def cmd_remove(
-        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
-    ) -> None:
-        if not ctx.args or len(ctx.args) < 2:
-            await _reply(update, "Usage: `/remove <platform> <url>`")
-            return
-
-        platform = ctx.args[0].lower().strip()
-        url      = ctx.args[1].strip().rstrip("/")
-
-        if platform not in self._cfg.platforms:
-            await _reply(update, "❌ Unknown platform\\.")
-            return
-
-        removed = self._profiles.remove(platform, url)
-        if removed:
-            await _reply(update, "🗑 Removed\\.")
-        else:
-            await _reply(update, "❌ URL not found in queue\\.")
-
-    # ── /list ─────────────────────────────────────────────────────────────────
-
-    @owner_only
-    async def cmd_list(
-        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
-    ) -> None:
+    async def _cb_list(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        chat     = update.effective_chat
         profiles = self._profiles.all()
         lines: list[str] = []
 
         for platform, urls in profiles.items():
             if not urls:
                 continue
-            lines.append(f"*{_esc(platform.upper())}* \\({len(urls)}\\)")
+            em   = PLATFORM_EMOJI.get(platform, "📁")
+            plat = self._cfg.platforms[platform]
+            lines.append(f"*{em} {_esc(plat.label)}* \\({len(urls)}\\)")
             for url in urls:
-                plat_cfg = self._cfg.platforms[platform]
-                uname = Downloader._extract_username(url, plat_cfg) or url
+                uname = Downloader._extract_username(url, plat) or url
                 lines.append(f"  • `{_esc(uname)}`")
 
-        if not lines:
-            await _reply(update, "No profiles queued\\.")
-            return
-
         total = self._profiles.total_count()
-        lines.append(f"\n_Total: {total} profile\\(s\\)_")
-        await _reply(update, "\n".join(lines))
+        if lines:
+            lines.append(f"\n_Total: {total} profile\\(s\\)_")
+            text = "\n".join(lines)
+        else:
+            text = "📭 No profiles queued\\.\n\nSend `instagram\\_profiles\\.txt` to import\\."
+
+        await _send(ctx, chat.id, text, reply_markup=_back_button())
+
+    async def _cb_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        chat      = update.effective_chat
+        profiles  = self._profiles.all()
+        cookies   = self._cookies.list_all()
+        plat_count = sum(1 for v in profiles.values() if v)
+        total      = self._profiles.total_count()
+        state      = "🔄 Download in progress" if self._running else "⏸ Idle"
+
+        lines = [
+            f"*📊 Status*\n",
+            f"*State:* {_esc(state)}",
+            f"*Active platforms:* {plat_count}",
+            f"*Profiles queued:* {total}",
+            f"*Cookie files:* {len(cookies)}",
+        ]
+        await _send(ctx, chat.id, "\n".join(lines), reply_markup=_back_button())
+
+    async def _cb_cookies(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        chat   = update.effective_chat
+        stored = self._cookies.list_all()
+
+        lines = ["*🍪 Cookie Files*\n"]
+        if stored:
+            for name, size in stored:
+                kb = size / 1024
+                lines.append(f"✅ `{_esc(name)}` — {kb:.1f} KB")
+        else:
+            lines.append("_No cookies uploaded yet\\._")
+
+        lines += [
+            "",
+            "*How to upload:*",
+            "1\\. Export cookies from your browser",
+            "   \\(use a Netscape cookies extension\\)",
+            "2\\. Send the file directly to this chat",
+            "   e\\.g\\. `instagram\\.com\\_cookies\\.txt`",
+        ]
+        await _send(ctx, chat.id, "\n".join(lines), reply_markup=_back_button())
+
+    async def _cb_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        if not self._running:
+            await _send(ctx, chat.id, "ℹ️ Nothing is running\\.", reply_markup=_back_button())
+            return
+        self._running = False
+        await _send(
+            ctx, chat.id,
+            "⚠️ Cancel requested\\. Current profile will finish, then the run stops\\.",
+            reply_markup=_back_button(),
+        )
+
+    async def _cb_allow_here(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        if chat.type == ChatType.PRIVATE:
+            await _send(
+                ctx, chat.id,
+                "ℹ️ Use this button *inside the group* you want to allow\\.",
+                reply_markup=_back_button(),
+            )
+            return
+        added = self._groups.allow(chat.id)
+        msg   = (
+            f"✅ Group `{_esc(str(chat.id))}` added to whitelist\\."
+            if added
+            else f"ℹ️ Group `{_esc(str(chat.id))}` already whitelisted\\."
+        )
+        await _send(ctx, chat.id, msg, reply_markup=_back_button())
+
+    async def _cb_groups_list(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        ids  = self._groups.list_all()
+        if not ids:
+            await _send(
+                ctx, chat.id,
+                "📭 No groups whitelisted yet\\.\n"
+                "Add the bot to a group and press *✅ Allow This Group*\\.",
+                reply_markup=_back_button(),
+            )
+            return
+        lines = ["*⚙️ Whitelisted Groups*\n"]
+        for gid in ids:
+            lines.append(f"• `{_esc(str(gid))}`")
+        await _send(ctx, chat.id, "\n".join(lines), reply_markup=_back_button())
+
+    async def _cb_remove_group_prompt(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        ids  = self._groups.list_all()
+        if not ids:
+            await _send(ctx, chat.id, "No groups to remove\\.", reply_markup=_back_button())
+            return
+        rows = [
+            [InlineKeyboardButton(f"🗑 {gid}", callback_data=f"grp:deny:{gid}")]
+            for gid in ids
+        ]
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="menu:main")])
+        await _send(
+            ctx, chat.id,
+            "*Select a group to remove:*",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    # ── /add ─────────────────────────────────────────────────────────────────
+
+    async def cmd_add(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._ok(update, require_owner=True):
+            return
+        if not ctx.args or len(ctx.args) < 2:
+            await _send(
+                ctx, update.effective_chat.id,
+                "Usage: `/add <platform> <url>`\n\nPlatforms: `instagram` `tiktok` `facebook` `x`",
+            )
+            return
+        platform = ctx.args[0].lower().strip()
+        url      = ctx.args[1].strip().rstrip("/")
+        if platform not in self._cfg.platforms:
+            plat_list = _esc(", ".join(self._cfg.platforms))
+            await _send(ctx, update.effective_chat.id, f"❌ Unknown platform\\. Use: {plat_list}")
+            return
+        if not url.startswith("http"):
+            await _send(ctx, update.effective_chat.id, "❌ URL must start with `http`\\.")
+            return
+        plat_cfg = self._cfg.platforms[platform]
+        username = Downloader._extract_username(url, plat_cfg) or url
+        added    = self._profiles.add(platform, url)
+        em       = PLATFORM_EMOJI.get(platform, "📁")
+        msg = (
+            f"✅ Added `{_esc(username)}` → *{em} {_esc(platform)}*"
+            if added else
+            "ℹ️ Already in queue\\."
+        )
+        await _send(ctx, update.effective_chat.id, msg)
+
+    # ── /remove ───────────────────────────────────────────────────────────────
+
+    async def cmd_remove(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._ok(update, require_owner=True):
+            return
+        if not ctx.args or len(ctx.args) < 2:
+            await _send(ctx, update.effective_chat.id, "Usage: `/remove <platform> <url>`")
+            return
+        platform = ctx.args[0].lower().strip()
+        url      = ctx.args[1].strip().rstrip("/")
+        if platform not in self._cfg.platforms:
+            await _send(ctx, update.effective_chat.id, "❌ Unknown platform\\.")
+            return
+        removed = self._profiles.remove(platform, url)
+        await _send(
+            ctx, update.effective_chat.id,
+            "🗑 Removed\\." if removed else "❌ URL not found\\.",
+        )
+
+    # ── /list ─────────────────────────────────────────────────────────────────
+
+    async def cmd_list(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._ok(update):
+            return
+        # Reuse callback implementation
+        await self._cb_list(update, ctx)
 
     # ── /clear ────────────────────────────────────────────────────────────────
 
-    @owner_only
-    async def cmd_clear(
-        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
-    ) -> None:
-        if not ctx.args:
-            await _reply(update, "Usage: `/clear <platform>`")
+    async def cmd_clear(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._ok(update, require_owner=True):
             return
-
+        if not ctx.args:
+            await _send(ctx, update.effective_chat.id, "Usage: `/clear <platform>`")
+            return
         platform = ctx.args[0].lower().strip()
         if platform not in self._cfg.platforms:
-            await _reply(update, "❌ Unknown platform\\.")
+            await _send(ctx, update.effective_chat.id, "❌ Unknown platform\\.")
             return
-
         count = self._profiles.clear(platform)
-        await _reply(
-            update,
-            f"🗑 Cleared {count} profile\\(s\\) from *{_esc(platform)}*\\."
+        em    = PLATFORM_EMOJI.get(platform, "📁")
+        await _send(
+            ctx, update.effective_chat.id,
+            f"🗑 Cleared {count} profile\\(s\\) from {em} *{_esc(platform)}*\\.",
         )
 
-    # ── /cookies ──────────────────────────────────────────────────────────────
+    # ── /allowgroup ───────────────────────────────────────────────────────────
 
-    @owner_only
-    async def cmd_cookies(
-        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
-    ) -> None:
-        names = self._cookies.list_all()
-        if not names:
-            await _reply(update, "No cookies uploaded yet\\.")
+    async def cmd_allowgroup(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._ok(update, require_owner=True):
+            return
+        chat = update.effective_chat
+
+        # Called with an ID argument: /allowgroup -1001234567
+        if ctx.args:
+            try:
+                gid   = int(ctx.args[0])
+                added = self._groups.allow(gid)
+                await _send(
+                    ctx, chat.id,
+                    f"✅ Group `{_esc(str(gid))}` whitelisted\\."
+                    if added else
+                    f"ℹ️ Group `{_esc(str(gid))}` already in list\\.",
+                )
+            except ValueError:
+                await _send(ctx, chat.id, "❌ Invalid group ID\\. Must be a number\\.")
             return
 
-        lines = ["🍪 *Uploaded cookies:*", ""]
-        for name in names:
-            path = self._cookies.path_for(name)
-            size_kb = path.stat().st_size / 1024
-            lines.append(f"`{_esc(name)}` — {size_kb:.1f} KB")
+        # Called inside the group itself with no argument
+        if chat.type == ChatType.PRIVATE:
+            await _send(
+                ctx, chat.id,
+                "Use `/allowgroup <group\\_id>` or run this command *inside the group*\\.",
+            )
+            return
 
-        await _reply(update, "\n".join(lines))
+        added = self._groups.allow(chat.id)
+        await _send(
+            ctx, chat.id,
+            f"✅ This group \\(`{_esc(str(chat.id))}`\\) is now whitelisted\\."
+            if added else
+            "ℹ️ This group is already whitelisted\\.",
+        )
+
+    # ── /denygroup ────────────────────────────────────────────────────────────
+
+    async def cmd_denygroup(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._ok(update, require_owner=True):
+            return
+        if not ctx.args:
+            await _send(ctx, update.effective_chat.id, "Usage: `/denygroup <group\\_id>`")
+            return
+        try:
+            gid     = int(ctx.args[0])
+            removed = self._groups.deny(gid)
+            await _send(
+                ctx, update.effective_chat.id,
+                f"🗑 Group `{_esc(str(gid))}` removed\\."
+                if removed else
+                f"❌ Group `{_esc(str(gid))}` not found\\.",
+            )
+        except ValueError:
+            await _send(ctx, update.effective_chat.id, "❌ Invalid group ID\\.")
+
+    # ── /groups ───────────────────────────────────────────────────────────────
+
+    async def cmd_groups(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._ok(update, require_owner=True):
+            return
+        await self._cb_groups_list(update, ctx)
 
     # ── /status ───────────────────────────────────────────────────────────────
 
-    @owner_only
-    async def cmd_status(
-        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
-    ) -> None:
-        profiles = self._profiles.all()
-        cookies  = self._cookies.list_all()
-
-        plat_count = sum(1 for v in profiles.values() if v)
-        total      = self._profiles.total_count()
-        running    = "🔄 Download in progress" if self._running else "⏸ Idle"
-
-        lines = [
-            f"*Status:* {_esc(running)}",
-            f"*Platforms active:* {plat_count}",
-            f"*Total profiles queued:* {total}",
-            f"*Cookies on disk:* {len(cookies)}",
-        ]
-        await _reply(update, "\n".join(lines))
+    async def cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._ok(update):
+            return
+        await self._cb_status(update, ctx)
 
     # ── /cancel ───────────────────────────────────────────────────────────────
 
-    @owner_only
-    async def cmd_cancel(
-        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
-    ) -> None:
-        if not self._running:
-            await _reply(update, "Nothing running\\.")
+    async def cmd_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._ok(update):
             return
-        self._running = False
-        await _reply(
-            update,
-            "⚠️ Cancel requested\\. Current download will finish then stop\\."
-        )
+        await self._cb_cancel(update, ctx)
+
+    # ── /cookies ──────────────────────────────────────────────────────────────
+
+    async def cmd_cookies(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._ok(update):
+            return
+        await self._cb_cookies(update, ctx)
 
     # ── /run ──────────────────────────────────────────────────────────────────
 
-    @owner_only
-    async def cmd_run(
-        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    async def cmd_run(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._ok(update):
+            return
+        mode_str = ctx.args[0].lower() if ctx.args else "both"
+        await self._execute_run(update, ctx, MediaMode.from_str(mode_str))
+
+    # ── Core download executor ────────────────────────────────────────────────
+
+    async def _execute_run(
+        self,
+        update: Update,
+        ctx:    ContextTypes.DEFAULT_TYPE,
+        mode:   MediaMode,
     ) -> None:
+        chat = update.effective_chat
+
         if self._running:
-            await _reply(
-                update,
-                "⚠️ A download is already running\\. Use `/cancel` first\\."
+            await _send(
+                ctx, chat.id,
+                "⚠️ A download is already running\\. Use *❌ Cancel Run* first\\.",
+                reply_markup=_back_button(),
             )
             return
 
-        mode_str = (ctx.args[0].lower() if ctx.args else "both")
-        mode     = MediaMode.from_str(mode_str)
-        total    = self._profiles.total_count()
-
+        total = self._profiles.total_count()
         if total == 0:
-            await _reply(
-                update,
-                "No profiles queued\\. Use `/add` or send a `*_profiles\\.txt` file\\."
+            await _send(
+                ctx, chat.id,
+                "📭 No profiles queued\\.\n\n"
+                "Send `instagram\\_profiles\\.txt` to the chat to import, or use `/add`\\.",
+                reply_markup=_back_button(),
             )
             return
 
+        is_forum   = getattr(chat, "is_forum", False)
         self._running = True
 
         try:
-            await _reply(
-                update,
+            await _send(
+                ctx, chat.id,
                 f"🚀 *Starting* \\[{_esc(mode.label())}\\]\n"
-                f"_{total} profile\\(s\\) queued\\.\\.\\._"
+                f"_{total} profile\\(s\\) queued\\.\\.\\._",
             )
 
-            grand_total_new = 0
+            grand_total = 0
 
             for platform, urls in self._profiles.all().items():
                 if not urls:
                     continue
                 if not self._running:
-                    await _reply(update, "🛑 Download cancelled\\.")
+                    await _send(ctx, chat.id, "🛑 Run cancelled\\.")
                     return
 
                 plat_cfg = self._cfg.platforms[platform]
-                await _reply(update, f"\n📂 *{_esc(plat_cfg.label)}*")
+                em       = PLATFORM_EMOJI.get(platform, "📁")
+
+                # Platform header in main thread
+                await _send(
+                    ctx, chat.id,
+                    f"\n📂 *{em} {_esc(plat_cfg.label)}*",
+                )
 
                 for url in urls:
                     if not self._running:
-                        await _reply(update, "🛑 Download cancelled\\.")
+                        await _send(ctx, chat.id, "🛑 Run cancelled\\.")
                         return
 
+                    username = Downloader._extract_username(url, plat_cfg) or url
+
+                    # ── Get or create forum topic ─────────────────────────
+                    thread_id: int | None = None
+                    if is_forum:
+                        thread_id = await self._get_or_create_topic(
+                            ctx, chat.id, platform, username
+                        )
+
+                    # Announce in topic (or main thread)
+                    await _send(
+                        ctx, chat.id,
+                        f"▶️ `{_esc(username)}`",
+                        thread_id=thread_id,
+                    )
+
+                    # ── Download ──────────────────────────────────────────
                     result = await self._dl.download_user(url, plat_cfg, mode)
 
                     if result.skipped:
-                        await _reply(
-                            update,
-                            f"⚠️ Skipped `{_esc(url)}`\n_{_esc(result.skip_reason)}_"
+                        await _send(
+                            ctx, chat.id,
+                            f"⚠️ Skipped: _{_esc(result.skip_reason)}_",
+                            thread_id=thread_id,
                         )
                         continue
 
-                    # Report per-subfolder archive status
+                    # Report archive status per subfolder
                     for sub in result.results:
-                        status_line = (
+                        line = (
                             f"  `\\[{_esc(sub.subfolder)}\\]` "
                             f"archive: {_esc(sub.archive_action)}"
                         )
                         if sub.error:
-                            status_line += f"\n  ⚠️ `{_esc(sub.error[:200])}`"
-                        await _reply(update, status_line)
+                            line += f"\n  ⚠️ `{_esc(sub.error[:200])}`"
+                        await _send(ctx, chat.id, line, thread_id=thread_id)
 
                     new_count = result.total_new
-                    grand_total_new += new_count
+                    grand_total += new_count
 
-                    await _reply(
-                        update,
-                        f"✅ `{_esc(result.username)}` — {new_count} new file\\(s\\)"
+                    await _send(
+                        ctx, chat.id,
+                        f"✅ `{_esc(username)}` — {new_count} new file\\(s\\)",
+                        thread_id=thread_id,
                     )
 
-                    # ── Send files to chat ──────────────────────────────────
+                    # ── Deliver files ─────────────────────────────────────
                     all_new: list[Path] = [
                         f for sub in result.results for f in sub.new_files
                     ]
-                    await self._deliver_files(update, all_new)
+                    await self._deliver_files(ctx, chat.id, all_new, thread_id)
 
-            await _reply(
-                update,
-                f"🏁 *All done* — {grand_total_new} new file\\(s\\) total\\."
+            await _send(
+                ctx, chat.id,
+                f"🏁 *All done* — {grand_total} new file\\(s\\) total\\.",
+                reply_markup=_back_button(),
             )
 
         except Exception as exc:
-            logger.exception("Unexpected error in /run: %s", exc)
-            await _reply(update, f"🔥 Internal error: `{_esc(str(exc)[:200])}`")
+            logger.exception("Unexpected error during run: %s", exc)
+            await _send(
+                ctx, chat.id,
+                f"🔥 Internal error: `{_esc(str(exc)[:200])}`",
+                reply_markup=_back_button(),
+            )
         finally:
             self._running = False
 
+    # ── Forum topic management ────────────────────────────────────────────────
+
+    async def _get_or_create_topic(
+        self,
+        ctx:      ContextTypes.DEFAULT_TYPE,
+        chat_id:  int,
+        platform: str,
+        username: str,
+    ) -> int | None:
+        """Return existing topic thread_id or create a new one."""
+        stored = self._topics.get(chat_id, platform, username)
+        if stored is not None:
+            return stored
+
+        em         = PLATFORM_EMOJI.get(platform, "📁")
+        color      = TOPIC_COLORS.get(platform, 0x6FB9F0)
+        topic_name = f"{em} {username}"[:128]
+
+        try:
+            topic = await ctx.bot.create_forum_topic(
+                chat_id=chat_id,
+                name=topic_name,
+                icon_color=color,
+            )
+            thread_id = topic.message_thread_id
+            self._topics.set(chat_id, platform, username, thread_id)
+            logger.info("Created topic '%s' thread_id=%d", topic_name, thread_id)
+            return thread_id
+        except BadRequest as exc:
+            logger.warning("Could not create topic '%s': %s", topic_name, exc)
+            return None
+        except TelegramError as exc:
+            logger.error("Topic creation error: %s", exc)
+            return None
+
+    # ── File delivery ─────────────────────────────────────────────────────────
+
     async def _deliver_files(
-        self, update: Update, files: list[Path]
+        self,
+        ctx:       ContextTypes.DEFAULT_TYPE,
+        chat_id:   int,
+        files:     list[Path],
+        thread_id: int | None,
     ) -> None:
-        """Send new files to chat, respecting size/count caps."""
         cap   = self._cfg.max_send_files
         limit = self._cfg.max_file_size_mb
-
-        sent    = 0
-        skipped = 0
+        sent  = 0
 
         for path in files:
             if sent >= cap:
-                remaining = len(files) - sent - skipped
+                remaining = len(files) - sent
                 if remaining > 0:
-                    await _reply(
-                        update,
-                        f"ℹ️ {remaining} more file\\(s\\) saved to disk "
-                        f"\\(cap of {cap} reached\\)\\."
+                    await _send(
+                        ctx, chat_id,
+                        f"ℹ️ {remaining} more file\\(s\\) saved to disk \\(cap of {cap} reached\\)\\.",
+                        thread_id=thread_id,
                     )
                 break
 
             try:
                 size_mb = path.stat().st_size / (1024 * 1024)
             except OSError:
-                skipped += 1
                 continue
 
             if size_mb > limit:
-                await _reply(
-                    update,
+                await _send(
+                    ctx, chat_id,
                     f"⚠️ `{_esc(path.name)}` is {size_mb:.1f} MB — "
-                    f"too large for Telegram \\(max {limit} MB\\), saved to disk\\."
+                    f"too large for Telegram \\(max {limit} MB\\), saved to disk\\.",
+                    thread_id=thread_id,
                 )
-                skipped += 1
                 continue
 
-            ok = await _send_file(
-                update, path,
-                self._cfg.video_exts,
-                self._cfg.photo_exts,
-            )
-            if ok:
+            ext = path.suffix.lstrip(".").lower()
+            try:
+                with path.open("rb") as fh:
+                    if ext in self._cfg.video_exts:
+                        await ctx.bot.send_video(
+                            chat_id=chat_id,
+                            video=fh,
+                            message_thread_id=thread_id,
+                        )
+                    elif ext in self._cfg.photo_exts:
+                        await ctx.bot.send_photo(
+                            chat_id=chat_id,
+                            photo=fh,
+                            message_thread_id=thread_id,
+                        )
+                    else:
+                        await ctx.bot.send_document(
+                            chat_id=chat_id,
+                            document=fh,
+                            message_thread_id=thread_id,
+                        )
                 sent += 1
-            else:
-                skipped += 1
+            except TelegramError:
+                # Fallback: send as document
+                try:
+                    with path.open("rb") as fh:
+                        await ctx.bot.send_document(
+                            chat_id=chat_id,
+                            document=fh,
+                            message_thread_id=thread_id,
+                        )
+                    sent += 1
+                except TelegramError as exc:
+                    logger.warning("Could not send %s: %s", path.name, exc)
 
-        logger.info("Delivered %d file(s), skipped %d", sent, skipped)
+        logger.info("Delivered %d/%d file(s) to chat=%d thread=%s", sent, len(files), chat_id, thread_id)
 
-    # ── Document handler (cookies + bulk import) ──────────────────────────────
+    # ── Document upload handler ───────────────────────────────────────────────
 
-    @owner_only
     async def handle_document(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        """Handle cookie file and bulk profile imports sent as documents."""
+        chat = update.effective_chat
+
+        # Group: must be whitelisted. Cookie/profile upload: owner only.
+        if not self._ok(update, require_owner=True):
+            return
+
         doc  = update.message.document
         name = (doc.file_name or "").strip()
 
         if not name:
             return
 
-        # ── Cookie file upload ───────────────────────────────────────────────
+        # ── Cookie file ────────────────────────────────────────────────────
         if self._cookies.is_valid_name(name):
             try:
                 tg_file = await ctx.bot.get_file(doc.file_id)
                 raw     = await tg_file.download_as_bytearray()
                 if not raw:
-                    await _reply(update, "❌ Received empty file\\.")
+                    await _send(ctx, chat.id, "❌ Received empty file\\.")
                     return
                 self._cookies.save(name, bytes(raw))
-                await _reply(
-                    update,
-                    f"🍪 Cookie saved: `{_esc(name)}` \\({len(raw):,} bytes\\)"
+                await _send(
+                    ctx, chat.id,
+                    f"🍪 Cookie saved: `{_esc(name)}` \\({len(raw):,} bytes\\)\n\n"
+                    f"Use *▶️ Run* to start downloading\\.",
+                    reply_markup=_main_menu(self._user_is_owner(update)),
                 )
             except (TelegramError, OSError) as exc:
                 logger.error("Cookie upload failed: %s", exc)
-                await _reply(update, f"❌ Failed to save cookie: `{_esc(str(exc))}`")
+                await _send(ctx, chat.id, f"❌ Failed to save cookie: `{_esc(str(exc)[:150])}`")
             return
 
-        # ── Bulk profile import ──────────────────────────────────────────────
+        # ── Bulk profile import ────────────────────────────────────────────
         for platform in self._cfg.platforms:
             if name == f"{platform}_profiles.txt":
                 try:
                     tg_file = await ctx.bot.get_file(doc.file_id)
                     raw     = await tg_file.download_as_bytearray()
                     text    = raw.decode(errors="replace")
-                    urls = [
+                    urls    = [
                         line.strip().rstrip("/")
                         for line in text.splitlines()
                         if line.strip().startswith("http")
                     ]
                     if not urls:
-                        await _reply(update, "❌ No valid URLs found in file\\.")
+                        await _send(ctx, chat.id, "❌ No valid URLs found in the file\\.")
                         return
                     added = self._profiles.add_bulk(platform, urls)
                     total = len(self._profiles.get(platform))
-                    await _reply(
-                        update,
+                    em    = PLATFORM_EMOJI.get(platform, "📁")
+                    await _send(
+                        ctx, chat.id,
                         f"📋 Added *{added}* profile\\(s\\) to "
-                        f"*{_esc(platform)}* \\({total} total\\)"
+                        f"{em} *{_esc(platform)}* \\({total} total\\)\n\n"
+                        f"Press *▶️ Run* to start downloading\\.",
+                        reply_markup=_main_menu(self._user_is_owner(update)),
                     )
                 except (TelegramError, OSError) as exc:
                     logger.error("Bulk import failed: %s", exc)
-                    await _reply(update, f"❌ Import failed: `{_esc(str(exc))}`")
+                    await _send(ctx, chat.id, f"❌ Import failed: `{_esc(str(exc)[:150])}`")
                 return
 
-        await _reply(
-            update,
-            f"❓ Unrecognised file: `{_esc(name)}`\\.\n"
-            "Expected `instagram\\.com\\_cookies\\.txt` or `instagram\\_profiles\\.txt` etc\\."
+        await _send(
+            ctx, chat.id,
+            f"❓ Unrecognised file: `{_esc(name)}`\n\n"
+            "*Expected files:*\n"
+            "`instagram\\.com\\_cookies\\.txt`\n"
+            "`tiktok\\.com\\_cookies\\.txt`\n"
+            "`instagram\\_profiles\\.txt`\n"
+            "`tiktok\\_profiles\\.txt`  etc\\.",
         )
+
+
+# ── Bot commands list (for Telegram "/" menu) ─────────────────────────────────
+
+BOT_COMMANDS: list[BotCommand] = [
+    BotCommand("start",       "Show main menu"),
+    BotCommand("run",         "Start download [photos|videos|both]"),
+    BotCommand("add",         "Add a profile: /add <platform> <url>"),
+    BotCommand("remove",      "Remove a profile: /remove <platform> <url>"),
+    BotCommand("list",        "Show all queued profiles"),
+    BotCommand("clear",       "Clear a platform: /clear <platform>"),
+    BotCommand("status",      "Show queue summary and run state"),
+    BotCommand("cookies",     "List uploaded cookie files"),
+    BotCommand("cancel",      "Stop an ongoing download"),
+    BotCommand("allowgroup",  "Whitelist a group: /allowgroup [group_id]"),
+    BotCommand("denygroup",   "Remove a group: /denygroup <group_id>"),
+    BotCommand("groups",      "List all whitelisted groups"),
+]
