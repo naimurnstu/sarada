@@ -1,5 +1,11 @@
 """
 storage.py — Atomic persistence for profiles, cookies, groups, and topics.
+
+Fixes applied (v5):
+  BUG #5 — CookieStore.list_all() wrapped in try/except FileNotFoundError.
+            Railway's ephemeral filesystem can delete /data between restarts;
+            calling iterdir() on a missing directory previously raised
+            FileNotFoundError, crashing the status panel.
 """
 
 from __future__ import annotations
@@ -163,14 +169,26 @@ class CookieStore:
         return (self._dir / cookie_file).exists()
 
     def list_all(self) -> list[tuple[str, int]]:
-        """Returns [(name, size_bytes), ...] sorted by name."""
+        """
+        Returns [(name, size_bytes), ...] sorted by name.
+
+        FIX (BUG #5): Wrapped iterdir() in try/except FileNotFoundError.
+        Railway's ephemeral filesystem can delete /data between container
+        restarts. Calling iterdir() on a non-existent directory raises
+        FileNotFoundError, which previously crashed the status panel callback.
+        """
         result = []
-        for f in sorted(self._dir.iterdir()):
-            if f.is_file() and f.suffix == ".txt":
-                try:
-                    result.append((f.name, f.stat().st_size))
-                except OSError:
-                    pass
+        try:
+            for f in sorted(self._dir.iterdir()):
+                if f.is_file() and f.suffix == ".txt":
+                    try:
+                        result.append((f.name, f.stat().st_size))
+                    except OSError:
+                        pass
+        except FileNotFoundError:
+            logger.warning(
+                "Cookie directory %s does not exist — returning empty list.", self._dir
+            )
         return result
 
 
@@ -261,4 +279,7 @@ class TopicStore:
         gkey = str(group_id)
         data.setdefault(gkey, {})[self._key(platform, username)] = thread_id
         self._save(data)
-        logger.debug("Topic stored: group=%d %s:%s → thread=%d", group_id, platform, username, thread_id)
+        logger.debug(
+            "Topic stored: group=%d %s:%s → thread=%d",
+            group_id, platform, username, thread_id,
+        )
