@@ -3,5 +3,15 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
+# ON_FAILURE: Railway restarts the container when it exits with code != 0.
+# os._exit(1) in bot.py's Conflict handler triggers this restart.
+# After the conflict window closes (~10-15s), the restarted instance
+# will be the only one polling.
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
+
+# drainSeconds: Railway waits this long before sending SIGKILL to the old
+# container during a redeploy.  30s is enough for the old instance to receive
+# SIGTERM, finish any in-flight update, and exit cleanly.
+# Without this, old + new containers both poll simultaneously → Conflict.
+drainSeconds = 30
